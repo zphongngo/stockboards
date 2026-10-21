@@ -1,0 +1,6 @@
+streamlit
+numpy
+requests
+truststore
+websockets
+pandas
