@@ -1,21 +1,29 @@
 import streamlit as st
 import html
+import io
 import json
+import logging
 import math
 import numpy as np
+import openpyxl
+import openpyxl.styles
 import os
 import re
 import requests
 import sys
+import subprocess
 import threading
 import time
 import truststore
 from datetime import datetime
+from dotenv import load_dotenv
+from telegram_inbox import list_conversations, list_messages, record_message
+from stock_data import fetch_price_board
 
-# Dùng kho chứng chỉ của Windows để xác thực SSL (cần khi mạng công ty có proxy kiểm tra SSL)
+# Dung kho chung chi cua Windows de xac thuc SSL (can khi mang cong ty co proxy kiem tra SSL)
 truststore.inject_into_ssl()
 
-# Cho phép chạy bằng "python app.py" (nút ▶ của VS Code): tự khởi động lại qua "streamlit run"
+# Cho phep chay bang "python app.py" (nut ▶ cua VS Code): tu khoi dong lai qua "streamlit run"
 if __name__ == "__main__":
     from streamlit import runtime
     if not runtime.exists():
@@ -23,25 +31,17 @@ if __name__ == "__main__":
         sys.argv = ["streamlit", "run", __file__]
         sys.exit(stcli.main())
 
-# Nguồn dữ liệu realtime: API bảng giá của Vietcap (cùng nguồn vnstock sử dụng, không cần đăng nhập)
-PRICE_BOARD_URL = "https://trading.vietcap.com.vn/api/price/symbols/getList"
-PRICE_BOARD_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Content-Type": "application/json",
-    "Referer": "https://trading.vietcap.com.vn/",
-    "Origin": "https://trading.vietcap.com.vn",
-}
-POLL_SECONDS = 3  # Chu kỳ lấy dữ liệu mới và làm mới bảng
-STOCK_DETAIL_URL = "https://24hmoney.vn/stock/{ticker}"  # Trang mở khi bấm vào 1 mã
+POLL_SECONDS = 3  # Chu ky lay du lieu moi va lam moi bang
+STOCK_DETAIL_URL = "https://24hmoney.vn/stock/{ticker}"  # Trang mo khi bam vao 1 ma
 
-# 1. Cấu hình trang Streamlit
+# 1. Cau hinh trang Streamlit
 st.set_page_config(
-    page_title="Bảng Giá Chứng Khoán Phân Ngành - FireAnt Style",
+    page_title="Bang Gia Chung Khoan Phan Nganh - FireAnt Style",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# 2. Định nghĩa CSS custom cho giao diện Dark Mode chuẩn chứng khoán
+# 2. Dinh nghia CSS custom cho giao dien Dark Mode chuan chung khoan
 st.markdown("""
     <style>
     .stApp {
@@ -51,7 +51,7 @@ st.markdown("""
     .stApp [data-testid="stCaptionContainer"] {
         color: #8b949e;
     }
-    /* Bố cục gọn để toàn bộ các ngành vừa 1 màn hình 1920x1080 */
+    /* Bo cuc gon de toan bo cac nganh vua 1 man hinh 1920x1080 */
     header[data-testid="stHeader"] {
         display: none;
     }
@@ -69,7 +69,7 @@ st.markdown("""
         line-height: 1.2;
     }
     .board {
-        column-count: 6;      /* 6-8 cột (đặt trong render_board), trình duyệt tự cân bằng chiều cao các cột */
+        column-count: 6;      /* 6-8 cot (dat trong render_board), trinh duyet tu can bang chieu cao cac cot */
         column-gap: 8px;
     }
     .sector-card {
@@ -78,7 +78,7 @@ st.markdown("""
         border-radius: 6px;
         padding: 4px 5px;
         margin-bottom: 6px;
-        break-inside: avoid;   /* không cắt 1 ngành ra 2 cột */
+        break-inside: avoid;   /* khong cat 1 nganh ra 2 cot */
     }
     .sector-header {
         font-weight: 700;
@@ -103,13 +103,13 @@ st.markdown("""
         padding: 1px 6px;
         border-radius: 3px;
         margin-bottom: 1px;
-        text-decoration: none !important;  /* mỗi dòng là 1 link sang 24hmoney - bỏ gạch chân */
+        text-decoration: none !important;  /* moi dong la 1 link sang 24hmoney - bo gach chan */
     }
     .stock-row:hover {
         filter: brightness(1.5);
         outline: 1px solid rgba(240, 246, 252, 0.4);
     }
-    /* !important để màu theo giá không bị màu link mặc định của Streamlit ghi đè */
+    /* !important de mau theo gia khong bi mau link mac dinh cua Streamlit ghi de */
     .ceil { background-color: rgba(156, 39, 176, 0.25); color: #e040fb !important; border-left: 3px solid #e040fb; }
     .up { background-color: rgba(46, 125, 50, 0.25); color: #4caf50 !important; border-left: 3px solid #4caf50; }
     .ref { background-color: rgba(245, 124, 0, 0.2); color: #ffb74d !important; border-left: 3px solid #ffb74d; }
@@ -118,31 +118,39 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 3. Danh sách các nhóm ngành và mã cổ phiếu tương ứng
-#    Danh sách mặc định - dùng khi chưa có file sectors.json (người dùng sửa qua nút "Quản lý ngành")
+# 3. Danh sach cac nhom nganh va ma co phieu tuong ung
+#    Danh sach mac dinh - dung khi chua co file sectors.json (nguoi dung sua qua nut "Quan ly nganh")
 DEFAULT_SECTORS = {
-    "NGÂN HÀNG": ["EIB", "STB", "TPB", "MSB", "VIB", "BID", "CTG", "MBB", "TCB", "VCB", "ACB", "VPB", "HDB", "NVB",  # NVB = mã CK của NCB
+    "NGAN HANG": ["EIB", "STB", "TPB", "MSB", "VIB", "BID", "CTG", "MBB", "TCB", "VCB", "ACB", "VPB", "HDB", "NVB",  # NVB = ma CK cua NCB
                   "ABB", "BVB", "LPB"],
-    "CHỨNG KHOÁN": ["ORS", "VIX", "MBS", "VDS", "SHS", "VCI", "BSI", "SSI", "VND", "CTS", "FTS", "HCM",
+    "CHUNG KHOAN": ["ORS", "VIX", "MBS", "VDS", "SHS", "VCI", "BSI", "SSI", "VND", "CTS", "FTS", "HCM",
                     "TCX", "VCK", "VPX", "AAS", "APS"],
-    "BẤT ĐỘNG SẢN": ["HDC", "CEO", "NLG", "DIG", "VHM", "HDG", "VIC", "DXG", "PDR", "NVL", "KDH", "TCH", "HHS"],
-    "VLXD - ĐẦU TƯ CÔNG": ["C4G", "G36", "HBC", "LCG", "CII", "HHV", "FCN", "HUT", "CTD", "KSB", "VCG", "HT1"],
-    "BĐS KCN - CAO SU": ["SZC", "DRC", "TDC", "DPR", "KBC", "PHR", "LHG", "VGC", "TIP", "GVR", "IDC", "BCM"],
-    "ĐIỆN NƯỚC": ["GEE", "GEX", "GEL", "PC1", "QTP", "GEG", "REE", "NT2", "POW", "BWE", "PPC", "TDM"],
-    "THỰC PHẨM": ["DBC", "PAN", "HNG", "QNS", "HAG", "BAF", "SAB", "MSN", "VNM", "KDC", "SBT", "SLS", "NAF"],
-    "XUẤT KHẨU": ["ASM", "TCM", "VGT", "GIL", "TNG", "VHC", "ANV", "IDI", "STK", "FMC"],
-    "DẦU KHÍ": ["OIL", "PVC", "PLX", "BSR", "GAS", "PVD", "PVB", "PVS", "PVT"],
-    "CẢNG BIỂN": ["VSC", "SGP", "HAH", "GMD", "DVP", "PHP", "PVP", "VOS", "VIP", "DXP"],
-    "HÓA CHẤT - PHÂN BÓN": ["DPM", "DGC", "DDV", "CSV", "DCM", "LAS", "BFC"],
-    "THÉP": ["NKG", "HSG", "HPG", "TLH", "SMC", "TVN"],
+    "BAT DONG SAN": ["HDC", "CEO", "NLG", "DIG", "VHM", "HDG", "VIC", "DXG", "PDR", "NVL", "KDH", "TCH", "HHS"],
+    "VLXD - DAU TU CONG": ["C4G", "G36", "HBC", "LCG", "CII", "HHV", "FCN", "HUT", "CTD", "KSB", "VCG", "HT1"],
+    "BDS KCN - CAO SU": ["SZC", "DRC", "TDC", "DPR", "KBC", "PHR", "LHG", "VGC", "TIP", "GVR", "IDC", "BCM"],
+    "DIEN NUOC": ["GEE", "GEX", "GEL", "PC1", "QTP", "GEG", "REE", "NT2", "POW", "BWE", "PPC", "TDM"],
+    "THUC PHAM": ["DBC", "PAN", "HNG", "QNS", "HAG", "BAF", "SAB", "MSN", "VNM", "KDC", "SBT", "SLS", "NAF"],
+    "XUAT KHAU": ["ASM", "TCM", "VGT", "GIL", "TNG", "VHC", "ANV", "IDI", "STK", "FMC"],
+    "DAU KHI": ["OIL", "PVC", "PLX", "BSR", "GAS", "PVD", "PVB", "PVS", "PVT"],
+    "CANG BIEN": ["VSC", "SGP", "HAH", "GMD", "DVP", "PHP", "PVP", "VOS", "VIP", "DXP"],
+    "HOA CHAT - PHAN BON": ["DPM", "DGC", "DDV", "CSV", "DCM", "LAS", "BFC"],
+    "THEP": ["NKG", "HSG", "HPG", "TLH", "SMC", "TVN"],
     "CNTT": ["FPT", "FOX", "FOC", "CMG", "VGI", "ELC", "CTR", "MFS", "ICT"],
-    "KHOÁNG SẢN": ["MSR", "BKC", "KSV"],
-    "BÁN LẺ": ["FRT", "PET", "MWG", "DMX", "PNJ", "DGW"]
+    "KHOANG SAN": ["MSR", "BKC", "KSV"],
+    "BAN LE": ["FRT", "PET", "MWG", "DMX", "PNJ", "DGW"]
 }
 
-# File lưu danh sách ngành do người dùng chỉnh sửa: cạnh StockBoard.exe khi chạy bản .exe, cạnh app.py khi chạy code
+# File luu danh sach nganh do nguoi dung chinh sua: canh StockBoard.exe khi chay ban .exe, canh app.py khi chay code
 DATA_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 SECTORS_FILE = os.path.join(DATA_DIR, "sectors.json")
+TELEGRAM_ALERTS_FILE = os.path.join(DATA_DIR, "telegram_alerts.json")
+TELEGRAM_BOT_STATUS_FILE = os.path.join(DATA_DIR, ".telegram_bot_status")
+TELEGRAM_BOT_STOP_FILE = os.path.join(DATA_DIR, ".telegram_bot_stop")
+TELEGRAM_BOT_SCRIPT = os.path.join(DATA_DIR, "telegram_bot.py")
+TELEGRAM_BOT_LOG = os.path.join(DATA_DIR, "telegram_bot.log")
+TELEGRAM_INBOX_DATABASE = os.path.join(DATA_DIR, "telegram_inbox.db")
+load_dotenv(os.path.join(DATA_DIR, "Phong_telegram.env"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
 def load_sectors():
@@ -152,40 +160,157 @@ def load_sectors():
         if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()):
             return {str(k): [str(t) for t in v] for k, v in data.items()}
     except (OSError, ValueError):
-        pass  # Chưa có file hoặc file hỏng -> dùng danh sách mặc định
+        pass  # Chua co file hoac file hong -> dung danh sach mac dinh
     return {k: list(v) for k, v in DEFAULT_SECTORS.items()}
 
 
 def save_sectors(sectors):
-    # Ghi ra file tạm rồi đổi tên, tránh hỏng file nếu bị ngắt giữa chừng
+    # Ghi ra file tam roi doi ten, tranh hong file neu bi ngat giua chung
     tmp_path = SECTORS_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(sectors, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, SECTORS_FILE)
 
 
+def parse_telegram_chat_ids(value):
+    values = value if isinstance(value, (list, tuple)) else str(value or "").split(",")
+    return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+
+def load_telegram_alert_settings():
+    settings = {
+        "enabled": True,
+        "threshold": 2.0,
+        "duration_minutes": 15,
+        "chat_ids": parse_telegram_chat_ids(
+            os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID", "")
+        ),
+    }
+    try:
+        with open(TELEGRAM_ALERTS_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            if isinstance(saved.get("enabled"), bool):
+                settings["enabled"] = saved["enabled"]
+            threshold = float(saved.get("threshold", settings["threshold"]))
+            if math.isfinite(threshold) and 0 < threshold <= 100:
+                settings["threshold"] = threshold
+            duration = int(saved.get("duration_minutes", settings["duration_minutes"]))
+            if 1 <= duration <= 1440:
+                settings["duration_minutes"] = duration
+            if "chat_ids" in saved:
+                settings["chat_ids"] = parse_telegram_chat_ids(saved["chat_ids"])
+    except (OSError, TypeError, ValueError):
+        pass
+    return settings
+
+
+def save_telegram_alert_settings(enabled, threshold, duration_minutes, chat_ids):
+    tmp_path = TELEGRAM_ALERTS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "enabled": enabled,
+            "threshold": threshold,
+            "duration_minutes": duration_minutes,
+            "chat_ids": chat_ids,
+        }, f, indent=2)
+    os.replace(tmp_path, TELEGRAM_ALERTS_FILE)
+
+
+def get_telegram_bot_status():
+    try:
+        heartbeat_age = time.time() - os.path.getmtime(TELEGRAM_BOT_STATUS_FILE)
+    except OSError:
+        return "Stopped"
+    return "Running" if 0 <= heartbeat_age < 20 else "Stopped"
+
+
+def start_telegram_bot():
+    if get_telegram_bot_status() == "Running":
+        return False, "Telegram bot is already running."
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "TELEGRAM_BOT_TOKEN is missing from Phong_telegram.env."
+    if getattr(sys, "frozen", False):
+        return False, "Start the bot with Python when using the packaged StockBoard executable."
+    if not os.path.isfile(TELEGRAM_BOT_SCRIPT):
+        return False, f"Could not find {TELEGRAM_BOT_SCRIPT}."
+
+    try:
+        try:
+            os.remove(TELEGRAM_BOT_STOP_FILE)
+        except FileNotFoundError:
+            pass
+        with open(TELEGRAM_BOT_LOG, "a", encoding="utf-8") as log_file:
+            subprocess.Popen(
+                [sys.executable, TELEGRAM_BOT_SCRIPT],
+                cwd=DATA_DIR,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+    except OSError as error:
+        logging.exception("Could not start Telegram bot")
+        return False, f"Could not start Telegram bot: {error}"
+    return True, "Telegram bot start requested. Its status will update shortly."
+
+
+def stop_telegram_bot():
+    if get_telegram_bot_status() != "Running":
+        return False, "Telegram bot is not running."
+    try:
+        with open(TELEGRAM_BOT_STOP_FILE, "w", encoding="ascii") as stop_request:
+            stop_request.write("stop")
+    except OSError as error:
+        logging.exception("Could not request Telegram bot shutdown")
+        return False, f"Could not stop Telegram bot: {error}"
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if get_telegram_bot_status() != "Running":
+            return True, "Telegram bot stopped."
+        time.sleep(0.2)
+
+    try:
+        os.remove(TELEGRAM_BOT_STOP_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logging.exception("Could not clear Telegram bot stop request")
+    return False, "Bot did not stop; restart it to enable web start/stop control."
+
+
 SECTOR_MAP = load_sectors()
 ALL_TICKERS = list(dict.fromkeys(t for tickers in SECTOR_MAP.values() for t in tickers))
 
 SESSION_LABELS = {
-    "ATO": "Phiên ATO", "LO": "Phiên liên tục", "LO_MORNING": "Phiên sáng", "LO_AFTERNOON": "Phiên chiều",
-    "BREAK": "Nghỉ trưa", "INTERMISSION": "Nghỉ trưa",
-    "ATC": "Phiên ATC", "PT": "Thỏa thuận", "ENDED": "Đã đóng cửa",
+    "ATO": "Phien ATO", "LO": "Phien lien tuc", "LO_MORNING": "Phien sang", "LO_AFTERNOON": "Phien chieu",
+    "BREAK": "Nghi trua", "INTERMISSION": "Nghi trua",
+    "ATC": "Phien ATC", "PT": "Thoa thuan", "ENDED": "Da dong cua",
 }
 
 
-# 4. Kho dữ liệu realtime dùng chung + Background Thread cập nhật liên tục
-#    (Thread ngầm KHÔNG được dùng st.session_state - chỉ ghi vào kho này, có khóa để an toàn luồng)
+# 4. Kho du lieu realtime dung chung + Background Thread cap nhat lien tuc
+#    (Thread ngam KHONG duoc dung st.session_state - chi ghi vao kho nay, co khoa de an toan luong)
 class LiveQuoteStore:
     def __init__(self):
         self.lock = threading.Lock()
         self.wake = threading.Event()
-        self.ready = threading.Event()  # được bật sau lần lấy dữ liệu đầu tiên
-        self.tickers = list(ALL_TICKERS)  # danh sách mã cần lấy, cập nhật khi sửa SECTOR_MAP
-        self.quotes = {}          # ticker -> dict giá
-        self.last_update = None   # thời điểm lấy dữ liệu thành công gần nhất
-        self.session = None       # trạng thái phiên giao dịch
-        self.error = None         # lỗi gần nhất (None nếu đang kết nối tốt)
+        self.ready = threading.Event()  # duoc bat sau lan lay du lieu dau tien
+        self.tickers = list(ALL_TICKERS)  # danh sach ma can lay, cap nhat khi sua SECTOR_MAP
+        self.quotes = {}          # ticker -> dict gia
+        self.last_update = None   # thoi diem lay du lieu thanh cong gan nhat
+        self.session = None       # trang thai phien giao dich
+        self.error = None         # loi gan nhat (None neu dang ket noi tot)
+        self.alert_date = None
+        self.alerted_today = set()
+        self.breach_since = {}
+        alert_settings = load_telegram_alert_settings()
+        self.telegram_enabled = alert_settings["enabled"]
+        self.telegram_threshold = alert_settings["threshold"]
+        self.telegram_duration_minutes = alert_settings["duration_minutes"]
+        self.telegram_chat_ids = alert_settings["chat_ids"]
 
     def snapshot(self):
         with self.lock:
@@ -194,39 +319,214 @@ class LiveQuoteStore:
     def refresh_now(self):
         self.wake.set()
 
+    def alert_settings(self):
+        with self.lock:
+            return (
+                self.telegram_enabled,
+                self.telegram_threshold,
+                self.telegram_duration_minutes,
+                list(self.telegram_chat_ids),
+            )
 
-def classify(price, ref, ceiling, floor):
-    """Phân loại màu theo giá trần/sàn/tham chiếu thực tế của sàn"""
-    if price >= ceiling:
-        return "ceil"
-    if price <= floor:
-        return "floor"
-    if price > ref:
-        return "up"
-    if price < ref:
-        return "down"
-    return "ref"
+    def update_alert_settings(self, enabled, threshold, duration_minutes, chat_ids):
+        with self.lock:
+            if (
+                enabled != self.telegram_enabled
+                or threshold != self.telegram_threshold
+                or duration_minutes != self.telegram_duration_minutes
+            ):
+                self.breach_since.clear()
+            self.telegram_enabled = enabled
+            self.telegram_threshold = threshold
+            self.telegram_duration_minutes = duration_minutes
+            self.telegram_chat_ids = list(chat_ids)
 
 
-def fetch_price_board(tickers):
-    resp = requests.post(PRICE_BOARD_URL, json={"symbols": tickers}, headers=PRICE_BOARD_HEADERS, timeout=10)
-    resp.raise_for_status()
-    quotes, session = {}, None
-    for item in resp.json():
-        info, match = item.get("listingInfo") or {}, item.get("matchPrice") or {}
-        ref = info.get("refPrice") or 0
-        if not ref:
-            continue
-        # Chưa có lệnh khớp trong ngày -> hiển thị giá tham chiếu
-        price = match.get("matchPrice") or ref
-        session = session or match.get("session")
-        quotes[info["symbol"]] = {
-            "price": price / 1000,                                     # nghìn đồng
-            "pct": round((price - ref) / ref * 100, 2),
-            "vol": (match.get("accumulatedVolume") or 0) / 1_000_000,  # triệu cổ phiếu
-            "cls": classify(price, ref, info.get("ceiling") or 0, info.get("floor") or 0),
+def send_telegram_message(chat_id, message):
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "The bot token is not configured."
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": chat_id, "text": message},
+            timeout=5,
+        )
+    except requests.RequestException:
+        logging.warning("Could not connect to Telegram Bot API.")
+        return False, "Could not reach Telegram; check the network connection."
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = {}
+    if response.ok and isinstance(result, dict) and result.get("ok"):
+        record_message(TELEGRAM_INBOX_DATABASE, chat_id, "outgoing", message)
+        return True, None
+
+    reason = result.get("description", f"Telegram returned HTTP {response.status_code}.")
+    logging.warning("Telegram rejected a message: %s", reason)
+    return False, reason
+
+
+def format_ticker_alert_sections(strong_tickers, weak_tickers, quotes, threshold):
+    def format_row(ticker):
+        quote = quotes[ticker]
+        volume = quote.get("volume")
+        if volume is None:
+            volume = round(quote.get("vol", 0) * 1000)
+        return f"{ticker}     {quote['price']:.2f}     {quote['pct']:+.2f}%     {volume:,.0f}"
+
+    strong_rows = "\n".join(format_row(ticker) for ticker in strong_tickers) or "None"
+    weak_rows = "\n".join(format_row(ticker) for ticker in weak_tickers) or "None"
+    return (
+        f"1. Co Phieu Manh (>{threshold:g}%) :\n"
+        "----------------------------\n"
+        f"{strong_rows}\n\n"
+        f"2. Co Phieu Yeu (<-{threshold:g}%) :\n"
+        "----------------------------\n"
+        f"{weak_rows}"
+    )
+
+
+def send_threshold_alerts(store, quotes):
+    enabled, threshold, duration_minutes, chat_ids = store.alert_settings()
+    if not enabled or not TELEGRAM_BOT_TOKEN or not chat_ids:
+        return
+
+    today = datetime.now().date()
+    now = time.monotonic()
+    pending_by_chat = {chat_id: [] for chat_id in chat_ids}
+    with store.lock:
+        if store.alert_date != today:
+            store.alert_date = today
+            store.alerted_today.clear()
+
+        active_breaches = set()
+        for ticker in store.tickers:
+            quote = quotes.get(ticker)
+            pct = quote["pct"] if quote else None
+            direction = "up" if pct is not None and pct > threshold else (
+                "down" if pct is not None and pct < -threshold else None
+            )
+            if not direction:
+                continue
+
+            breach_key = (ticker, direction)
+            active_breaches.add(breach_key)
+            started_at = store.breach_since.setdefault(breach_key, now)
+            if now - started_at < duration_minutes * 60:
+                continue
+
+            for chat_id in chat_ids:
+                if (ticker, direction, chat_id) not in store.alerted_today:
+                    pending_by_chat[chat_id].append((ticker, pct, direction))
+
+        store.breach_since = {
+            key: started_at
+            for key, started_at in store.breach_since.items()
+            if key in active_breaches
         }
-    return quotes, session
+
+    for chat_id, pending in pending_by_chat.items():
+        if not pending:
+            continue
+        strong_tickers = [ticker for ticker, _, direction in pending if direction == "up"]
+        weak_tickers = [ticker for ticker, _, direction in pending if direction == "down"]
+        message = (
+            f"StockBoard daily change alert (threshold: +/-{threshold:g}%, "
+            f"sustained for {duration_minutes} min)\n\n"
+            + format_ticker_alert_sections(strong_tickers, weak_tickers, quotes, threshold)
+        )
+        sent, error = send_telegram_message(chat_id, message)
+        if not sent:
+            logging.warning("Telegram alert to a recipient failed: %s", error)
+            continue
+        with store.lock:
+            store.alerted_today.update(
+                (ticker, direction, chat_id) for ticker, _, direction in pending
+            )
+
+
+def send_telegram_test(chat_ids, threshold, duration_minutes, tickers, quotes, updated_at):
+    message = (
+        "StockBoard test message. Telegram delivery is working.\n"
+        f"Current alert rule: +/-{threshold:g}% sustained for {duration_minutes} min."
+    )
+    if not quotes:
+        message += "\n\nLive ticker snapshot is not available."
+    else:
+        strong_tickers = sorted(
+            (ticker for ticker in tickers if ticker in quotes and quotes[ticker]["pct"] > threshold),
+            key=lambda ticker: abs(quotes[ticker]["pct"]),
+            reverse=True,
+        )
+        weak_tickers = sorted(
+            (ticker for ticker in tickers if ticker in quotes and quotes[ticker]["pct"] < -threshold),
+            key=lambda ticker: abs(quotes[ticker]["pct"]),
+            reverse=True,
+        )
+        snapshot_time = updated_at.strftime("%Y-%m-%d %H:%M:%S") if updated_at else "unknown"
+        message += f"\n\nLive ticker snapshot (updated {snapshot_time}):\n"
+        message += format_ticker_alert_sections(
+            strong_tickers, weak_tickers, quotes, threshold
+        )
+
+    successful, failed = [], []
+    for chat_id in chat_ids:
+        sent, error = send_telegram_message(chat_id, message)
+        if sent:
+            successful.append(chat_id)
+        else:
+            failed.append((chat_id, error))
+    return successful, failed
+
+
+@st.fragment(run_every=5)
+def render_telegram_inbox():
+    conversations = list_conversations(TELEGRAM_INBOX_DATABASE)
+    if not conversations:
+        st.caption("No Telegram conversations yet.")
+        return
+
+    conversation_by_id = {str(item["chat_id"]): item for item in conversations}
+    chat_ids = list(conversation_by_id)
+    if st.session_state.get("telegram_inbox_chat") not in chat_ids:
+        st.session_state["telegram_inbox_chat"] = chat_ids[0]
+
+    selected_chat_id = st.selectbox(
+        "Conversation",
+        options=chat_ids,
+        format_func=lambda chat_id: (
+            f"{conversation_by_id[chat_id]['display_name'] or chat_id}"
+            + (
+                f" (@{conversation_by_id[chat_id]['username']})"
+                if conversation_by_id[chat_id]["username"]
+                else ""
+            )
+        ),
+        key="telegram_inbox_chat",
+    )
+    with st.container(height=320, border=True):
+        for item in list_messages(TELEGRAM_INBOX_DATABASE, selected_chat_id):
+            role = "user" if item["direction"] == "incoming" else "assistant"
+            with st.chat_message(role):
+                created_at = datetime.fromisoformat(item["created_at"]).astimezone()
+                st.caption(created_at.strftime("%Y-%m-%d %H:%M:%S"))
+                st.write(item["text"])
+
+    with st.form(f"telegram_inbox_reply_{selected_chat_id}", clear_on_submit=True):
+        reply_text = st.text_area("Reply", key=f"telegram_reply_text_{selected_chat_id}")
+        send_reply = st.form_submit_button("Send reply", width="stretch")
+    if send_reply:
+        reply_text = reply_text.strip()
+        if not reply_text:
+            st.error("Enter a reply first.")
+        else:
+            sent, error = send_telegram_message(selected_chat_id, reply_text)
+            if sent:
+                st.success("Reply sent.")
+            else:
+                st.error(f"Reply failed: {error}")
 
 
 def poll_forever(store):
@@ -234,6 +534,7 @@ def poll_forever(store):
         started = time.monotonic()
         try:
             quotes, session = fetch_price_board(store.tickers)
+            send_threshold_alerts(store, quotes)
             with store.lock:
                 store.quotes = quotes
                 store.session = session
@@ -243,21 +544,21 @@ def poll_forever(store):
             with store.lock:
                 store.error = str(e)
         store.ready.set()
-        # Trừ thời gian gọi API để giữ chu kỳ đều POLL_SECONDS giây
+        # Tru thoi gian goi API de giu chu ky deu POLL_SECONDS giay
         store.wake.wait(max(0.0, POLL_SECONDS - (time.monotonic() - started)))
         store.wake.clear()
 
 
-# Chỉ khởi chạy 1 thread duy nhất, dùng chung cho mọi người dùng/tab đang mở
+# Chi khoi chay 1 thread duy nhat, dung chung cho moi nguoi dung/tab dang mo
 @st.cache_resource
 def start_live_feed():
     store = LiveQuoteStore()
     threading.Thread(target=poll_forever, args=(store,), daemon=True).start()
-    store.ready.wait(timeout=15)  # Chờ lần lấy dữ liệu đầu tiên để không hiện dữ liệu giả lập lúc mở app
+    store.ready.wait(timeout=15)  # Cho lan lay du lieu dau tien de khong hien du lieu gia lap luc mo app
     return store
 
 
-# 5. Dữ liệu giả lập - chỉ dùng khi chưa kết nối được nguồn realtime
+# 5. Du lieu gia lap - chi dung khi chua ket noi duoc nguon realtime
 @st.cache_data(ttl=10)
 def get_simulated_data():
     quotes = {}
@@ -276,21 +577,21 @@ def get_simulated_data():
         quotes[ticker] = {
             "price": round(np.random.uniform(10.0, 75.0), 2),
             "pct": pct_change,
-            "vol": round(np.random.uniform(0.15, 3.8), 2),
+            "vol": round(np.random.uniform(150, 3800)),
             "cls": css_cls,
         }
     return quotes
 
 
 store = start_live_feed()
-# Thread ngầm chạy liên tục nên không tự thấy mã mới thêm vào SECTOR_MAP - cập nhật cho nó ở mỗi lần chạy script
+# Thread ngam chay lien tuc nen khong tu thay ma moi them vao SECTOR_MAP - cap nhat cho no o moi lan chay script
 if store.tickers != ALL_TICKERS:
     store.tickers = list(ALL_TICKERS)
     store.refresh_now()
 
-# 6. Quản lý ngành: thêm/xóa/đổi tên ngành, thêm/xóa mã trong ngành (lưu vào sectors.json)
+# 6. Quan ly nganh: them/xoa/doi ten nganh, them/xoa ma trong nganh (luu vao sectors.json)
 def clean_tickers(items):
-    """Chuẩn hóa mã: viết hoa, bỏ trùng; cho phép dán nhiều mã 1 lần (vd: 'dxs, nha')"""
+    """Chuan hoa ma: viet hoa, bo trung; cho phep dan nhieu ma 1 lan (vd: 'dxs, nha')"""
     result = []
     for item in items:
         for part in re.split(r"[\s,;]+", str(item)):
@@ -301,109 +602,319 @@ def clean_tickers(items):
 
 
 def find_unknown_tickers(tickers):
-    """Trả về các mã không có trên bảng giá (gõ sai, đã hủy niêm yết...)"""
+    """Tra ve cac ma khong co tren bang gia (go sai, da huy niem yet...)"""
     quotes, _ = fetch_price_board(tickers)
     return [t for t in tickers if t not in quotes]
 
 
 def validate_and_save(sectors, new_tickers, success_msg):
-    """Kiểm tra mã mới với bảng giá rồi lưu. Trả về thông báo lỗi, hoặc None nếu đã lưu thành công."""
+    """Kiem tra ma moi voi bang gia roi luu. Tra ve thong bao loi, hoac None neu da luu thanh cong."""
     if new_tickers:
         try:
             unknown = find_unknown_tickers(new_tickers)
         except requests.RequestException as e:
-            return f"Không kiểm tra được mã cổ phiếu (lỗi kết nối): {e}"
+            return f"Khong kiem tra duoc ma co phieu (loi ket noi): {e}"
         if unknown:
-            return f"Không tìm thấy mã trên bảng giá: {', '.join(unknown)}. Kiểm tra lại mã (vd: NCB phải nhập là NVB)."
+            return f"Khong tim thay ma tren bang gia: {', '.join(unknown)}. Kiem tra lai ma (vd: NCB phai nhap la NVB)."
     try:
         save_sectors(sectors)
     except OSError as e:
-        return f"Không lưu được file {SECTORS_FILE}: {e}"
+        return f"Khong luu duoc file {SECTORS_FILE}: {e}"
     st.session_state["mg_flash"] = success_msg
     st.rerun()
 
 
-@st.dialog("⚙️ Quản lý ngành", width="medium")
+# Xuat/nhap danh sach nganh bang Excel: moi dong 1 ma, 2 cot | Sector | Ticker |
+EXCEL_HEADERS = ("Sector", "Ticker")
+
+
+def sectors_to_excel(sectors):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sectors"
+    ws.append(EXCEL_HEADERS)
+    for sector, tickers in sectors.items():
+        for ticker in tickers:
+            ws.append((sector, ticker))
+    for cell in ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True)
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 12
+    ws.freeze_panes = "A2"
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def sectors_from_excel(file):
+    """Doc file Excel 2 cot Sector | Ticker (sheet dau tien). O Sector de trong = cung nganh voi dong tren."""
+    try:
+        wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
+    except Exception as e:
+        raise ValueError(f"Khong doc duoc file Excel: {e}")
+    sectors, current = {}, None
+    for i, row in enumerate(wb.worksheets[0].iter_rows(values_only=True)):
+        sector = str(row[0]).strip().upper() if len(row) > 0 and row[0] is not None else ""
+        cell = row[1] if len(row) > 1 else None
+        if i == 0 and sector == "SECTOR":
+            continue  # dong tieu de
+        if sector:
+            current = sector
+        tickers = clean_tickers([cell]) if cell is not None else []
+        if not tickers:
+            continue
+        if current is None:
+            raise ValueError(f"Dong {i + 1}: co ma {tickers[0]} nhung chua co ten nganh (cot Sector).")
+        bucket = sectors.setdefault(current, [])
+        bucket.extend(t for t in tickers if t not in bucket)
+    wb.close()
+    if not sectors:
+        raise ValueError("File khong co du lieu. Can 2 cot: Sector | Ticker.")
+    return sectors
+
+
+@st.dialog("⚙️ Quan ly nganh", width="medium")
 def manage_sectors():
     sectors = load_sectors()
-    tab_edit, tab_add = st.tabs(["Sửa / xóa ngành", "Thêm ngành mới"])
+    tab_edit, tab_add, tab_excel = st.tabs(["Sua / xoa nganh", "Them nganh moi", "📊 Excel"])
 
     with tab_edit:
         if not sectors:
-            st.info("Chưa có ngành nào. Thêm ngành ở thẻ \"Thêm ngành mới\".")
+            st.info("Chua co nganh nao. Them nganh o the \"Them nganh moi\".")
         else:
-            sel = st.selectbox("Ngành", list(sectors), key="mg_sector")
-            new_name = st.text_input("Tên ngành", value=sel, key=f"mg_name_{sel}")
+            sel = st.selectbox("Nganh", list(sectors), key="mg_sector")
+            new_name = st.text_input("Ten nganh", value=sel, key=f"mg_name_{sel}")
             tickers = st.multiselect(
-                "Mã cổ phiếu", options=sectors[sel], default=sectors[sel],
+                "Ma co phieu", options=sectors[sel], default=sectors[sel],
                 accept_new_options=True, key=f"mg_tickers_{sel}",
-                placeholder="Gõ mã mới rồi nhấn Enter",
+                placeholder="Go ma moi roi nhan Enter",
             )
-            st.caption("Bấm **×** trên mã để xóa · Gõ mã mới (vd: DXS) rồi nhấn **Enter** để thêm · Bấm **Lưu** để áp dụng")
+            st.caption("Bam **×** tren ma de xoa · Go ma moi (vd: DXS) roi nhan **Enter** de them · Bam **Luu** de ap dung")
 
             col_save, col_delete = st.columns(2)
-            if col_save.button("💾 Lưu thay đổi", type="primary", width="stretch", key="mg_save"):
+            if col_save.button("💾 Luu thay doi", type="primary", width="stretch", key="mg_save"):
                 name = new_name.strip().upper()
                 cleaned = clean_tickers(tickers)
                 if not name:
-                    st.error("Tên ngành không được để trống.")
+                    st.error("Ten nganh khong duoc de trong.")
                 elif name != sel and name in sectors:
-                    st.error(f"Đã có ngành \"{name}\".")
+                    st.error(f"Da co nganh \"{name}\".")
                 elif not cleaned:
-                    st.error("Ngành cần ít nhất 1 mã. Muốn bỏ cả ngành thì bấm \"Xóa ngành\".")
+                    st.error("Nganh can it nhat 1 ma. Muon bo ca nganh thi bam \"Xoa nganh\".")
                 else:
-                    # Giữ nguyên vị trí ngành trên bảng khi đổi tên
+                    # Giu nguyen vi tri nganh tren bang khi doi ten
                     updated = {(name if k == sel else k): (cleaned if k == sel else v) for k, v in sectors.items()}
                     added = [t for t in cleaned if t not in sectors[sel]]
-                    error = validate_and_save(updated, added, f"Đã lưu ngành {name} ({len(cleaned)} mã)")
+                    error = validate_and_save(updated, added, f"Da luu nganh {name} ({len(cleaned)} ma)")
                     st.error(error)
-            with col_delete.popover("🗑️ Xóa ngành", width="stretch"):
-                st.write(f"Xóa ngành **{sel}** ({len(sectors[sel])} mã) khỏi bảng giá?")
-                if st.button("Xác nhận xóa", type="primary", key="mg_delete"):
+            with col_delete.popover("🗑️ Xoa nganh", width="stretch"):
+                st.write(f"Xoa nganh **{sel}** ({len(sectors[sel])} ma) khoi bang gia?")
+                if st.button("Xac nhan xoa", type="primary", key="mg_delete"):
                     remaining = {k: v for k, v in sectors.items() if k != sel}
-                    st.error(validate_and_save(remaining, [], f"Đã xóa ngành {sel}"))
+                    st.error(validate_and_save(remaining, [], f"Da xoa nganh {sel}"))
 
     with tab_add:
-        name = st.text_input("Tên ngành mới", key="mg_new_name", placeholder="VD: HÀNG KHÔNG")
-        raw = st.text_input("Mã cổ phiếu (cách nhau bởi dấu phẩy)", key="mg_new_tickers", placeholder="VD: HVN, VJC, ACV")
-        if st.button("➕ Thêm ngành", type="primary", key="mg_add"):
+        name = st.text_input("Ten nganh moi", key="mg_new_name", placeholder="VD: HANG KHONG")
+        raw = st.text_input("Ma co phieu (cach nhau boi dau phay)", key="mg_new_tickers", placeholder="VD: HVN, VJC, ACV")
+        if st.button("➕ Them nganh", type="primary", key="mg_add"):
             name = name.strip().upper()
             cleaned = clean_tickers([raw])
             if not name:
-                st.error("Nhập tên ngành.")
+                st.error("Nhap ten nganh.")
             elif name in sectors:
-                st.error(f"Đã có ngành \"{name}\" - sửa ở thẻ \"Sửa / xóa ngành\".")
+                st.error(f"Da co nganh \"{name}\" - sua o the \"Sua / xoa nganh\".")
             elif not cleaned:
-                st.error("Nhập ít nhất 1 mã cổ phiếu.")
+                st.error("Nhap it nhat 1 ma co phieu.")
             else:
                 st.error(validate_and_save({**sectors, name: cleaned}, cleaned,
-                                           f"Đã thêm ngành {name} ({len(cleaned)} mã)"))
+                                           f"Da them nganh {name} ({len(cleaned)} ma)"))
+
+    with tab_excel:
+        st.markdown("**Xuat ra Excel**")
+        st.download_button(
+            "📥 Xuat Excel", data=sectors_to_excel(sectors),
+            file_name=f"sectors_{datetime.now():%Y%m%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click="ignore", key="mg_export",
+        )
+        st.caption(f"{len(sectors)} nganh, {sum(map(len, sectors.values()))} ma · Moi dong 1 ma, 2 cot: Sector | Ticker")
+
+        st.markdown("**Nhap tu Excel**")
+        uploaded = st.file_uploader("Chon file .xlsx (cot A: Sector, cot B: Ticker)", type=["xlsx"], key="mg_import_file")
+        if uploaded is not None:
+            try:
+                imported = sectors_from_excel(uploaded)
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                st.caption(f"Doc duoc {len(imported)} nganh, {sum(map(len, imported.values()))} ma: "
+                           + ", ".join(imported))
+                mode = st.segmented_control(
+                    "Cach nhap", ["Thay the toan bo", "Gop vao danh sach hien tai"],
+                    default="Thay the toan bo", key="mg_import_mode",
+                )
+                skip_unknown = st.checkbox("Bo qua ma khong tim thay tren bang gia", value=True, key="mg_import_skip")
+                if st.button("📤 Nhap du lieu", type="primary", key="mg_import"):
+                    if mode == "Gop vao danh sach hien tai":
+                        result = {k: list(v) for k, v in sectors.items()}
+                        for sector, tickers in imported.items():
+                            bucket = result.setdefault(sector, [])
+                            bucket.extend(t for t in tickers if t not in bucket)
+                    else:
+                        result = imported
+                    known = {t for v in sectors.values() for t in v}
+                    to_check = list(dict.fromkeys(t for v in result.values() for t in v if t not in known))
+                    try:
+                        unknown = find_unknown_tickers(to_check) if to_check else []
+                    except requests.RequestException as e:
+                        st.error(f"Khong kiem tra duoc ma co phieu (loi ket noi): {e}")
+                    else:
+                        if unknown and not skip_unknown:
+                            st.error(f"Khong tim thay ma tren bang gia: {', '.join(unknown)}. "
+                                     "Sua file, hoac tich \"Bo qua ma khong tim thay\".")
+                        else:
+                            result = {k: [t for t in v if t not in unknown] for k, v in result.items()}
+                            result = {k: v for k, v in result.items() if v}  # bo nganh khong con ma nao
+                            msg = f"Da nhap {len(result)} nganh, {sum(map(len, result.values()))} ma tu Excel"
+                            if unknown:
+                                msg += f" (bo qua: {', '.join(unknown)})"
+                            st.error(validate_and_save(result, [], msg))
 
     st.divider()
-    with st.popover("↩️ Khôi phục danh sách mặc định"):
-        st.write("Bỏ mọi thay đổi và dùng lại danh sách ngành ban đầu?")
-        if st.button("Xác nhận khôi phục", key="mg_reset"):
+    with st.popover("↩️ Khoi phuc danh sach mac dinh"):
+        st.write("Bo moi thay doi va dung lai danh sach nganh ban dau?")
+        if st.button("Xac nhan khoi phuc", key="mg_reset"):
             st.error(validate_and_save({k: list(v) for k, v in DEFAULT_SECTORS.items()}, [],
-                                       "Đã khôi phục danh sách ngành mặc định"))
+                                       "Da khoi phuc danh sach nganh mac dinh"))
 
 
 # 7. Header Bar
-col_h1, col_h2, col_h3 = st.columns([5, 1, 1], vertical_alignment="center")
+col_h1, col_h2, col_h3, col_h4 = st.columns([5, 1.2, 1.2, 1.3], vertical_alignment="center")
 with col_h1:
-    st.markdown('<div class="app-title">📈 Bảng Giá Phân Ngành Chứng Khoán</div>', unsafe_allow_html=True)
+    st.markdown('<div class="app-title">📈 Bang Gia Phan Nganh Chung Khoan</div>', unsafe_allow_html=True)
 with col_h2:
-    if st.button("⚙️ Quản lý ngành", width="stretch"):
+    if st.button("⚙️ Quan ly nganh", width="stretch"):
         manage_sectors()
 with col_h3:
-    if st.button("🔄 Làm Mới Dữ Liệu", width="stretch"):
+    if st.button("🔄 Lam Moi Du Lieu", width="stretch"):
         store.refresh_now()
         get_simulated_data.clear()
+with col_h4:
+    with st.popover("📨 Telegram", width="stretch"):
+        bot_status = get_telegram_bot_status()
+        status_led = "🟢" if bot_status == "Running" else "🔴"
+        st.caption(f"{status_led} Telegram command bot: {bot_status}")
+        if st.button(
+            "Stop Telegram Bot" if bot_status == "Running" else "Start Telegram Bot",
+            width="stretch",
+            key="telegram_bot_toggle",
+        ):
+            succeeded, message = (
+                stop_telegram_bot()
+                if bot_status == "Running"
+                else start_telegram_bot()
+            )
+            if succeeded:
+                st.success(message)
+            else:
+                st.error(message)
+            st.caption("Startup output is written to telegram_bot.log.")
+
+        with st.expander("User conversations", expanded=False):
+            render_telegram_inbox()
+
+        current_enabled, current_threshold, current_duration, current_chat_ids = store.alert_settings()
+        with st.form("telegram_alert_settings"):
+            enabled_input = st.checkbox(
+                "Enable Telegram price alerts",
+                value=current_enabled,
+            )
+            threshold_input = st.number_input(
+                "Daily change threshold (%)",
+                min_value=0.1,
+                max_value=100.0,
+                value=float(current_threshold),
+                step=0.1,
+                format="%.2f",
+            )
+            duration_input = st.number_input(
+                "Condition must last (minutes)",
+                min_value=1,
+                max_value=1440,
+                value=int(current_duration),
+                step=1,
+            )
+            chat_ids_input = st.text_input(
+                "Telegram chat IDs (comma-separated)",
+                value=", ".join(current_chat_ids),
+            )
+            st.caption("For a private chat, send /chatid to the bot and enter the numeric ID it returns.")
+            save_alert_settings = st.form_submit_button("Save alert settings", width="stretch")
+            send_test = st.form_submit_button("Send Test", width="stretch")
+
+        if save_alert_settings:
+            chat_ids = parse_telegram_chat_ids(chat_ids_input)
+            if not math.isfinite(threshold_input) or not 0 < threshold_input <= 100:
+                st.error("Threshold must be between 0.1% and 100%.")
+            elif not 1 <= duration_input <= 1440:
+                st.error("Duration must be between 1 and 1440 minutes.")
+            else:
+                try:
+                    save_telegram_alert_settings(
+                        enabled_input, threshold_input, duration_input, chat_ids
+                    )
+                except OSError as e:
+                    st.error(f"Could not save Telegram settings: {e}")
+                else:
+                    store.update_alert_settings(
+                        enabled_input, threshold_input, duration_input, chat_ids
+                    )
+                    current_enabled = enabled_input
+                    current_threshold = threshold_input
+                    current_duration = duration_input
+                    current_chat_ids = chat_ids
+                    st.success("Telegram alert settings saved.")
+
+        if send_test:
+            chat_ids = parse_telegram_chat_ids(chat_ids_input)
+            if not TELEGRAM_BOT_TOKEN:
+                st.error("Add TELEGRAM_BOT_TOKEN to Phong_telegram.env before sending a test.")
+            elif not chat_ids:
+                st.error("Enter at least one Telegram chat ID.")
+            elif (
+                not math.isfinite(threshold_input)
+                or not 0 < threshold_input <= 100
+                or not 1 <= duration_input <= 1440
+            ):
+                st.error("Enter a valid threshold and duration before sending a test.")
+            else:
+                quotes, quotes_updated_at, _, _ = store.snapshot()
+                successful, failed = send_telegram_test(
+                    chat_ids,
+                    threshold_input,
+                    duration_input,
+                    list(store.tickers),
+                    quotes,
+                    quotes_updated_at,
+                )
+                if successful:
+                    st.success(f"Test message sent to {len(successful)} recipient(s).")
+                if failed:
+                    failures = "; ".join(f"{chat_id}: {reason}" for chat_id, reason in failed)
+                    st.error(f"Could not send test message: {failures}")
+
+        if not TELEGRAM_BOT_TOKEN:
+            st.warning("Add TELEGRAM_BOT_TOKEN to Phong_telegram.env to enable alerts.")
+        elif not current_enabled:
+            st.caption("Telegram price alerts are disabled.")
+        elif not current_chat_ids:
+            st.caption("No recipient IDs configured; alerts are paused.")
 
 if "mg_flash" in st.session_state:
     st.toast(st.session_state.pop("mg_flash"), icon="✅")
 
 
-# 8. Render Grid Layout - Fragment tự chạy lại mỗi POLL_SECONDS giây, không tải lại toàn trang
+# 8. Render Grid Layout - Fragment tu chay lai moi POLL_SECONDS giay, khong tai lai toan trang
 @st.fragment(run_every=POLL_SECONDS)
 def render_board():
     quotes, last_update, session, error = store.snapshot()
@@ -411,48 +922,49 @@ def render_board():
     if quotes:
         source = f"🟢 Realtime (Vietcap) · {SESSION_LABELS.get(session, session or 'N/A')}"
         if error:
-            source = f"🟡 Mất kết nối, đang thử lại - hiển thị dữ liệu lúc {last_update:%H:%M:%S}"
+            source = f"🟡 Mat ket noi, dang thu lai - hien thi du lieu luc {last_update:%H:%M:%S}"
         updated = last_update
     else:
         quotes = get_simulated_data()
-        source = "🔴 Chưa kết nối được nguồn realtime - đang dùng dữ liệu giả lập"
+        source = "🔴 Chua ket noi duoc nguon realtime - dang dung du lieu gia lap"
         if error:
             source += f" ({error[:80]})"
         updated = datetime.now()
 
-    st.caption(f"Cập nhật lúc: {updated:%H:%M:%S} | Nguồn: {source} | Tự làm mới mỗi {POLL_SECONDS}s")
+    st.caption(f"Cap nhat luc: {updated:%H:%M:%S} | Nguon: {source} | Tu lam moi moi {POLL_SECONDS}s"
+               f" | Gia: nghin dong · KL: nghin co phieu | Telegram bot: {get_telegram_bot_status()}")
 
     if not SECTOR_MAP:
-        st.info("Chưa có ngành nào. Bấm \"⚙️ Quản lý ngành\" để thêm.")
+        st.info("Chua co nganh nao. Bam \"⚙️ Quan ly nganh\" de them.")
         return
 
-    # Thêm cột khi danh sách dài ra (mỗi thẻ ngành ~ số mã + 2 dòng tiêu đề; ~32 dòng/cột vừa màn hình 1080p)
+    # Them cot khi danh sach dai ra (moi the nganh ~ so ma + 2 dong tieu de; ~32 dong/cot vua man hinh 1080p)
     row_units = sum(len(tickers) + 2 for tickers in SECTOR_MAP.values())
     column_count = min(8, max(6, math.ceil(row_units / 32)))
 
-    # Toàn bộ các ngành trong 1 khối HTML, chia cột bằng CSS (.board) để vừa 1 màn hình
-    # HTML phải viết liền, không thụt lề/dòng trống, nếu không Markdown sẽ hiểu là code block
+    # Toan bo cac nganh trong 1 khoi HTML, chia cot bang CSS (.board) de vua 1 man hinh
+    # HTML phai viet lien, khong thut le/dong trong, neu khong Markdown se hieu la code block
     board_html = f'<div class="board" style="column-count: {column_count};">'
     for sector_name, tickers in SECTOR_MAP.items():
         board_html += (
             '<div class="sector-card">'
             '<div class="sector-header">'
             f'<span>{html.escape(sector_name)}</span>'
-            '<span style="font-size: 10px; color: #8b949e;">MÃ | GIÁ | % | KL</span>'
+            '<span style="font-size: 10px; color: #8b949e;">MA | GIA | % | KL</span>'
             '</div>'
         )
-        # Sắp xếp trong từng ngành theo % thay đổi, từ cao xuống thấp
+        # Sap xep trong tung nganh theo % thay doi, tu cao xuong thap
         rows = sorted(((t, quotes[t]) for t in tickers if t in quotes), key=lambda r: r[1]["pct"], reverse=True)
         for ticker, s in rows:
             sign = "+" if s['pct'] > 0 else ""
-            # Bấm vào mã -> mở trang chi tiết trên 24hmoney ở tab mới
+            # Bam vao ma -> mo trang chi tiet tren 24hmoney o tab moi
             board_html += (
                 f'<a class="stock-row {s["cls"]}" href="{STOCK_DETAIL_URL.format(ticker=ticker)}" '
-                f'target="_blank" rel="noopener noreferrer" title="Xem {ticker} trên 24hmoney">'
+                f'target="_blank" rel="noopener noreferrer" title="Xem {ticker} tren 24hmoney">'
                 f'<span style="width: 25%;">{ticker}</span>'
                 f'<span style="width: 25%;">{s["price"]:.2f}</span>'
                 f'<span style="width: 30%;">{sign}{s["pct"]:.2f}%</span>'
-                f'<span style="width: 20%; text-align: right; color: #8b949e;">{s["vol"]:.2f}</span>'
+                f'<span style="width: 20%; text-align: right; color: #8b949e;">{s["vol"]:,.0f}</span>'
                 '</a>'
             )
         board_html += "</div>"

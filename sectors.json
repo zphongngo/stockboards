@@ -1,5 +1,5 @@
 {
-  "NGÂN HÀNG": [
+  "NGAN HANG": [
     "EIB",
     "STB",
     "TPB",
@@ -18,7 +18,7 @@
     "BVB",
     "LPB"
   ],
-  "CHỨNG KHOÁN": [
+  "CHUNG KHOAN": [
     "ORS",
     "VIX",
     "MBS",
@@ -37,7 +37,7 @@
     "AAS",
     "APS"
   ],
-  "BẤT ĐỘNG SẢN": [
+  "BAT DONG SAN": [
     "HDC",
     "CEO",
     "NLG",
@@ -50,9 +50,10 @@
     "NVL",
     "KDH",
     "TCH",
-    "HHS"
+    "HHS",
+    "NTL"
   ],
-  "VLXD - ĐẦU TƯ CÔNG": [
+  "VLXD - DAU TU CONG": [
     "C4G",
     "G36",
     "HBC",
@@ -66,7 +67,7 @@
     "VCG",
     "HT1"
   ],
-  "BĐS KCN - CAO SU": [
+  "BDS KCN - CAO SU": [
     "SZC",
     "DRC",
     "TDC",
@@ -80,7 +81,7 @@
     "IDC",
     "BCM"
   ],
-  "ĐIỆN NƯỚC": [
+  "DIEN NUOC": [
     "GEE",
     "GEX",
     "GEL",
@@ -94,7 +95,7 @@
     "PPC",
     "TDM"
   ],
-  "THỰC PHẨM": [
+  "THUC PHAM": [
     "DBC",
     "PAN",
     "HNG",
@@ -109,7 +110,7 @@
     "SLS",
     "NAF"
   ],
-  "XUẤT KHẨU": [
+  "XUAT KHAU": [
     "ASM",
     "TCM",
     "VGT",
@@ -121,7 +122,7 @@
     "STK",
     "FMC"
   ],
-  "DẦU KHÍ": [
+  "DAU KHI": [
     "OIL",
     "PVC",
     "PLX",
@@ -132,7 +133,7 @@
     "PVS",
     "PVT"
   ],
-  "CẢNG BIỂN": [
+  "CANG BIEN": [
     "VSC",
     "SGP",
     "HAH",
@@ -144,7 +145,7 @@
     "VIP",
     "DXP"
   ],
-  "HÓA CHẤT - PHÂN BÓN": [
+  "HOA CHAT - PHAN BON": [
     "DPM",
     "DGC",
     "DDV",
@@ -153,13 +154,14 @@
     "LAS",
     "BFC"
   ],
-  "THÉP": [
+  "THEP": [
     "NKG",
     "HSG",
     "HPG",
     "TLH",
     "SMC",
-    "TVN"
+    "TVN",
+    "VGS"
   ],
   "CNTT": [
     "FPT",
@@ -172,12 +174,12 @@
     "MFS",
     "ICT"
   ],
-  "KHOÁNG SẢN": [
+  "KHOANG SAN": [
     "MSR",
     "BKC",
     "KSV"
   ],
-  "BÁN LẺ": [
+  "BAN LE": [
     "FRT",
     "PET",
     "MWG",
@@ -185,7 +187,7 @@
     "PNJ",
     "DGW"
   ],
-  "HÀNG KHÔNG": [
+  "HANG KHONG": [
     "HVN",
     "VJC",
     "ACV"

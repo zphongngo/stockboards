@@ -6,3 +6,9 @@ data/
 build/
 dist/
 *.spec.bak
+*.env
+telegram_alerts.json
+telegram_bot.log
+telegram_inbox.db
+.telegram_bot_status
+.telegram_bot_stop

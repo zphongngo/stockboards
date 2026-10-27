@@ -6,3 +6,5 @@ openpyxl
 pandas
 websockets
 pyinstaller
+python-dotenv
+python-telegram-bot
