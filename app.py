@@ -19,6 +19,13 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram_inbox import list_conversations, list_messages, record_message
 from stock_data import fetch_price_board
+from stock_history import (
+    get_history_summary,
+    get_latest_signal_snapshot,
+    get_recent_signals,
+    import_csv_files,
+    record_daily_close,
+)
 
 # Dung kho chung chi cua Windows de xac thuc SSL (can khi mang cong ty co proxy kiem tra SSL)
 truststore.inject_into_ssl()
@@ -149,6 +156,7 @@ TELEGRAM_BOT_STOP_FILE = os.path.join(DATA_DIR, ".telegram_bot_stop")
 TELEGRAM_BOT_SCRIPT = os.path.join(DATA_DIR, "telegram_bot.py")
 TELEGRAM_BOT_LOG = os.path.join(DATA_DIR, "telegram_bot.log")
 TELEGRAM_INBOX_DATABASE = os.path.join(DATA_DIR, "telegram_inbox.db")
+STOCK_HISTORY_DATABASE = os.path.join(DATA_DIR, "data", "stock_history.sqlite3")
 load_dotenv(os.path.join(DATA_DIR, "Phong_telegram.env"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -471,6 +479,24 @@ def send_telegram_test(chat_ids, threshold, duration_minutes, tickers, quotes, u
             strong_tickers, weak_tickers, quotes, threshold
         )
 
+    signal_date, signals = get_latest_signal_snapshot(
+        STOCK_HISTORY_DATABASE,
+        tickers=tickers,
+    )
+    message += "\n\nLatest daily BUY/SELL signals"
+    if signal_date is None:
+        message += ": no signals have been recorded yet."
+    elif not signals:
+        message += f" ({signal_date}): no BUY/SELL signals."
+    else:
+        message += f" ({signal_date}; up to {len(signals)} shown):\n"
+        message += "\n".join(
+            f"{item['ticker']} {item['signal']} | "
+            f"MA20 {item['ma20']:.2f} | MA50 {item['ma50']:.2f} | "
+            f"RSI14 {item['rsi14']:.1f}"
+            for item in signals
+        )
+
     successful, failed = [], []
     for chat_id in chat_ids:
         sent, error = send_telegram_message(chat_id, message)
@@ -534,6 +560,15 @@ def poll_forever(store):
         started = time.monotonic()
         try:
             quotes, session = fetch_price_board(store.tickers)
+            try:
+                record_daily_close(
+                    STOCK_HISTORY_DATABASE,
+                    quotes,
+                    datetime.now(),
+                    session,
+                )
+            except Exception:
+                logging.exception("Could not capture daily stock history")
             send_threshold_alerts(store, quotes)
             with store.lock:
                 store.quotes = quotes
@@ -789,7 +824,9 @@ def manage_sectors():
 
 
 # 7. Header Bar
-col_h1, col_h2, col_h3, col_h4 = st.columns([5, 1.2, 1.2, 1.3], vertical_alignment="center")
+col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns(
+    [5, 1.1, 1.1, 1.2, 1.3], vertical_alignment="center"
+)
 with col_h1:
     st.markdown('<div class="app-title">📈 Bang Gia Phan Nganh Chung Khoan</div>', unsafe_allow_html=True)
 with col_h2:
@@ -800,6 +837,68 @@ with col_h3:
         store.refresh_now()
         get_simulated_data.clear()
 with col_h4:
+    with st.popover("📚 Stock history", width="stretch"):
+        history_rows, latest_history_date = get_history_summary(STOCK_HISTORY_DATABASE)
+        st.caption(
+            f"{history_rows:,} daily rows"
+            + (f" · latest: {latest_history_date}" if latest_history_date else "")
+        )
+        with st.form("stock_history_import"):
+            history_files = st.file_uploader(
+                "Import CafeF CSV files",
+                type=["csv"],
+                accept_multiple_files=True,
+            )
+            import_history = st.form_submit_button(
+                "Import price history", width="stretch"
+            )
+        if import_history:
+            if not history_files:
+                st.error("Select at least one CSV file.")
+            else:
+                try:
+                    import_progress = st.progress(
+                        0.0, text="Preparing CSV import..."
+                    )
+                    imported_rows, skipped_rows = import_csv_files(
+                        STOCK_HISTORY_DATABASE,
+                        history_files,
+                        progress_callback=lambda fraction, message: import_progress.progress(
+                            min(fraction, 1.0), text=message
+                        ),
+                    )
+                    history_rows, latest_history_date = get_history_summary(
+                        STOCK_HISTORY_DATABASE
+                    )
+                    st.success(f"Imported or updated {imported_rows:,} rows.")
+                    if skipped_rows:
+                        st.warning(
+                            f"Skipped {skipped_rows:,} rows without a ticker symbol."
+                        )
+                    st.caption(
+                        f"Database total: {history_rows:,} rows · latest: "
+                        f"{latest_history_date}"
+                    )
+                except Exception as error:
+                    logging.exception("Could not import stock history CSV files")
+                    st.error(f"CSV import failed: {error}")
+
+        st.caption(
+            "Daily close is captured after 15:00 on weekdays when this app is running "
+            "and the market session is ended."
+        )
+        recent_signals = get_recent_signals(STOCK_HISTORY_DATABASE)
+        if recent_signals:
+            st.dataframe(
+                recent_signals,
+                hide_index=True,
+                alt="Recent BUY and SELL signals calculated from daily price history",
+            )
+        else:
+            st.caption("No BUY or SELL crossover signals recorded yet.")
+        st.caption("BUY/SELL rule: MA20 crossover MA50, filtered by RSI14.")
+
+with col_h5:
     with st.popover("📨 Telegram", width="stretch"):
         bot_status = get_telegram_bot_status()
         status_led = "🟢" if bot_status == "Running" else "🔴"
