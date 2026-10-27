@@ -2,3 +2,7 @@ streamlit
 numpy
 requests
 truststore
+openpyxl
+pandas
+websockets
+pyinstaller
