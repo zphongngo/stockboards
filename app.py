@@ -767,8 +767,6 @@ def send_telegram_test(
     message = (
         "StockBoard test message. Telegram delivery is working.\n"
         f"Threshold snapshot: +/-{threshold:g}% at {PRICE_UPDATE_SCHEDULE_TEXT}.\n"
-        f"Price change summary: {'enabled' if price_update_enabled else 'disabled'}; "
-        f"sends at {PRICE_UPDATE_SCHEDULE_TEXT}.\n"
         f"BUY/SELL signal interval: {signal_interval_minutes} min; "
         f"volume average lookback {volume_lookback_sessions} sessions.\n"
         "Price change schedule runs on weekdays using app local time.\n"
