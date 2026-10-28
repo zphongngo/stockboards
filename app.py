@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from telegram_inbox import list_conversations, list_messages, record_message
 from stock_data import fetch_price_board
 from stock_history import (
+    calculate_intraday_signals,
+    get_average_volumes,
     get_history_summary,
     get_latest_signal_snapshot,
     get_recent_signals,
@@ -190,6 +192,14 @@ def load_telegram_alert_settings():
         "enabled": True,
         "threshold": 2.0,
         "duration_minutes": 15,
+        "signal_interval_minutes": 30,
+        "volume_lookback_sessions": 10,
+        "price_update_enabled": False,
+        "buy_sell_enabled": True,
+        "ma_short_period": 20,
+        "ma_long_period": 50,
+        "rsi_level1": 50.0,
+        "rsi_level2": 70.0,
         "chat_ids": parse_telegram_chat_ids(
             os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID", "")
         ),
@@ -200,12 +210,39 @@ def load_telegram_alert_settings():
         if isinstance(saved, dict):
             if isinstance(saved.get("enabled"), bool):
                 settings["enabled"] = saved["enabled"]
+            if isinstance(saved.get("price_update_enabled"), bool):
+                settings["price_update_enabled"] = saved["price_update_enabled"]
+            if isinstance(saved.get("buy_sell_enabled"), bool):
+                settings["buy_sell_enabled"] = saved["buy_sell_enabled"]
+            elif isinstance(saved.get("enabled"), bool):
+                settings["buy_sell_enabled"] = saved["enabled"]
             threshold = float(saved.get("threshold", settings["threshold"]))
             if math.isfinite(threshold) and 0 < threshold <= 100:
                 settings["threshold"] = threshold
             duration = int(saved.get("duration_minutes", settings["duration_minutes"]))
             if 1 <= duration <= 1440:
                 settings["duration_minutes"] = duration
+            signal_interval = int(
+                saved.get("signal_interval_minutes", settings["signal_interval_minutes"])
+            )
+            if 5 <= signal_interval <= 360:
+                settings["signal_interval_minutes"] = signal_interval
+            volume_lookback = int(
+                saved.get("volume_lookback_sessions", settings["volume_lookback_sessions"])
+            )
+            if 10 <= volume_lookback <= 100 and volume_lookback % 5 == 0:
+                settings["volume_lookback_sessions"] = volume_lookback
+            ma_short_period = int(saved.get("ma_short_period", settings["ma_short_period"]))
+            ma_long_period = int(saved.get("ma_long_period", settings["ma_long_period"]))
+            if 2 <= ma_short_period < ma_long_period <= 500:
+                settings["ma_short_period"] = ma_short_period
+                settings["ma_long_period"] = ma_long_period
+            rsi_level1 = float(saved.get("rsi_level1", settings["rsi_level1"]))
+            rsi_level2 = float(saved.get("rsi_level2", settings["rsi_level2"]))
+            if math.isfinite(rsi_level1) and math.isfinite(rsi_level2):
+                if 0 <= rsi_level1 < rsi_level2 <= 100:
+                    settings["rsi_level1"] = rsi_level1
+                    settings["rsi_level2"] = rsi_level2
             if "chat_ids" in saved:
                 settings["chat_ids"] = parse_telegram_chat_ids(saved["chat_ids"])
     except (OSError, TypeError, ValueError):
@@ -213,13 +250,34 @@ def load_telegram_alert_settings():
     return settings
 
 
-def save_telegram_alert_settings(enabled, threshold, duration_minutes, chat_ids):
+def save_telegram_alert_settings(
+    enabled,
+    threshold,
+    duration_minutes,
+    signal_interval_minutes,
+    volume_lookback_sessions,
+    price_update_enabled,
+    buy_sell_enabled,
+    ma_short_period,
+    ma_long_period,
+    rsi_level1,
+    rsi_level2,
+    chat_ids,
+):
     tmp_path = TELEGRAM_ALERTS_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump({
             "enabled": enabled,
             "threshold": threshold,
             "duration_minutes": duration_minutes,
+            "signal_interval_minutes": signal_interval_minutes,
+            "volume_lookback_sessions": volume_lookback_sessions,
+            "price_update_enabled": price_update_enabled,
+            "buy_sell_enabled": buy_sell_enabled,
+            "ma_short_period": ma_short_period,
+            "ma_long_period": ma_long_period,
+            "rsi_level1": rsi_level1,
+            "rsi_level2": rsi_level2,
             "chat_ids": chat_ids,
         }, f, indent=2)
     os.replace(tmp_path, TELEGRAM_ALERTS_FILE)
@@ -318,7 +376,22 @@ class LiveQuoteStore:
         self.telegram_enabled = alert_settings["enabled"]
         self.telegram_threshold = alert_settings["threshold"]
         self.telegram_duration_minutes = alert_settings["duration_minutes"]
+        self.telegram_signal_interval_minutes = alert_settings[
+            "signal_interval_minutes"
+        ]
+        self.volume_lookback_sessions = alert_settings["volume_lookback_sessions"]
+        self.price_update_enabled = alert_settings["price_update_enabled"]
+        self.buy_sell_enabled = alert_settings["buy_sell_enabled"]
+        self.ma_short_period = alert_settings["ma_short_period"]
+        self.ma_long_period = alert_settings["ma_long_period"]
+        self.rsi_level1 = alert_settings["rsi_level1"]
+        self.rsi_level2 = alert_settings["rsi_level2"]
         self.telegram_chat_ids = alert_settings["chat_ids"]
+        self.signal_alert_date = None
+        self.signal_alerted_slots = set()
+        self.price_update_date = None
+        self.price_update_slots = set()
+        self.price_update_last_prices = None
 
     def snapshot(self):
         with self.lock:
@@ -327,16 +400,59 @@ class LiveQuoteStore:
     def refresh_now(self):
         self.wake.set()
 
+    def signal_settings(self):
+        with self.lock:
+            return (
+                self.buy_sell_enabled,
+                self.ma_short_period,
+                self.ma_long_period,
+                self.rsi_level1,
+                self.rsi_level2,
+            )
+
+    def update_signal_settings(
+        self, enabled, ma_short_period, ma_long_period, rsi_level1, rsi_level2
+    ):
+        with self.lock:
+            self.buy_sell_enabled = enabled
+            self.ma_short_period = ma_short_period
+            self.ma_long_period = ma_long_period
+            self.rsi_level1 = rsi_level1
+            self.rsi_level2 = rsi_level2
+
+    def price_update_settings(self):
+        with self.lock:
+            return (
+                self.price_update_enabled,
+                self.telegram_signal_interval_minutes,
+                list(self.telegram_chat_ids),
+            )
+
+    def volume_settings(self):
+        with self.lock:
+            return self.volume_lookback_sessions
+
+    def update_volume_settings(self, lookback_sessions):
+        with self.lock:
+            self.volume_lookback_sessions = lookback_sessions
+
+    def update_price_update_settings(self, enabled):
+        with self.lock:
+            self.price_update_enabled = enabled
+
     def alert_settings(self):
         with self.lock:
             return (
                 self.telegram_enabled,
                 self.telegram_threshold,
                 self.telegram_duration_minutes,
+                self.telegram_signal_interval_minutes,
                 list(self.telegram_chat_ids),
             )
 
-    def update_alert_settings(self, enabled, threshold, duration_minutes, chat_ids):
+    def update_alert_settings(
+        self, enabled, threshold, duration_minutes, signal_interval_minutes, chat_ids
+    ):
         with self.lock:
             if (
                 enabled != self.telegram_enabled
@@ -347,6 +463,7 @@ class LiveQuoteStore:
             self.telegram_enabled = enabled
             self.telegram_threshold = threshold
             self.telegram_duration_minutes = duration_minutes
+            self.telegram_signal_interval_minutes = signal_interval_minutes
             self.telegram_chat_ids = list(chat_ids)
 
 
@@ -376,32 +493,66 @@ def send_telegram_message(chat_id, message):
     return False, reason
 
 
-def format_ticker_alert_sections(strong_tickers, weak_tickers, quotes, threshold):
+def volume_relative_to_average(ticker, quotes, average_volumes):
+    quote = quotes[ticker]
+    volume = quote.get("volume")
+    if volume is None:
+        volume = quote.get("vol", 0) * 1000
+    average_volume = average_volumes.get(ticker)
+    if average_volume is None or average_volume <= 0:
+        return volume, "N/A"
+    return volume, f"{volume / average_volume * 100:.0f}%"
+
+
+def format_ticker_alert_sections(
+    strong_tickers,
+    weak_tickers,
+    quotes,
+    threshold,
+    average_volumes,
+    lookback_sessions,
+):
     def format_row(ticker):
         quote = quotes[ticker]
-        volume = quote.get("volume")
-        if volume is None:
-            volume = round(quote.get("vol", 0) * 1000)
-        return f"{ticker}     {quote['price']:.2f}     {quote['pct']:+.2f}%     {volume:,.0f}"
+        volume, relative_volume = volume_relative_to_average(
+            ticker, quotes, average_volumes
+        )
+        return (
+            f"{ticker:<7} {quote['price']:>8.2f} {quote['pct']:>+7.2f}% "
+            f"{volume:>12,.0f} {relative_volume:>8}"
+        )
 
     strong_rows = "\n".join(format_row(ticker) for ticker in strong_tickers) or "None"
     weak_rows = "\n".join(format_row(ticker) for ticker in weak_tickers) or "None"
+    header = (
+        f"{'Ma CK':<7} {'Gia':>8} {'Thay doi':>8} {'KLGD':>12} "
+        f"{'Vol/TB ' + str(lookback_sessions) + 'p':>8}"
+    )
     return (
         f"1. Co Phieu Manh (>{threshold:g}%) :\n"
         "----------------------------\n"
+        f"{header}\n"
         f"{strong_rows}\n\n"
         f"2. Co Phieu Yeu (<-{threshold:g}%) :\n"
         "----------------------------\n"
+        f"{header}\n"
         f"{weak_rows}"
     )
 
 
 def send_threshold_alerts(store, quotes):
-    enabled, threshold, duration_minutes, chat_ids = store.alert_settings()
+    enabled, threshold, duration_minutes, _, chat_ids = store.alert_settings()
     if not enabled or not TELEGRAM_BOT_TOKEN or not chat_ids:
         return
 
     today = datetime.now().date()
+    volume_lookback_sessions = store.volume_settings()
+    average_volumes = get_average_volumes(
+        STOCK_HISTORY_DATABASE,
+        store.tickers,
+        today,
+        volume_lookback_sessions,
+    )
     now = time.monotonic()
     pending_by_chat = {chat_id: [] for chat_id in chat_ids}
     with store.lock:
@@ -443,7 +594,14 @@ def send_threshold_alerts(store, quotes):
         message = (
             f"StockBoard daily change alert (threshold: +/-{threshold:g}%, "
             f"sustained for {duration_minutes} min)\n\n"
-            + format_ticker_alert_sections(strong_tickers, weak_tickers, quotes, threshold)
+            + format_ticker_alert_sections(
+                strong_tickers,
+                weak_tickers,
+                quotes,
+                threshold,
+                average_volumes,
+                volume_lookback_sessions,
+            )
         )
         sent, error = send_telegram_message(chat_id, message)
         if not sent:
@@ -455,11 +613,174 @@ def send_threshold_alerts(store, quotes):
             )
 
 
-def send_telegram_test(chat_ids, threshold, duration_minutes, tickers, quotes, updated_at):
+def scheduled_signal_slot(now, interval_minutes):
+    if now.weekday() >= 5:
+        return None
+    minute_of_day = now.hour * 60 + now.minute
+    if (
+        9 * 60 <= minute_of_day <= 15 * 60
+        and (minute_of_day - 9 * 60) % interval_minutes == 0
+    ):
+        return minute_of_day
+    if minute_of_day == 15 * 60 + 30:
+        return minute_of_day
+    return None
+
+
+def send_scheduled_signal_alerts(store, quotes, now):
+    signal_settings = store.signal_settings()
+    signal_enabled, ma_short_period, ma_long_period, rsi_level1, rsi_level2 = signal_settings
+    _, _, _, interval_minutes, chat_ids = store.alert_settings()
+    if not signal_enabled or not TELEGRAM_BOT_TOKEN or not chat_ids:
+        return
+    slot = scheduled_signal_slot(now, interval_minutes)
+    if slot is None:
+        return
+
+    with store.lock:
+        if store.signal_alert_date != now.date():
+            store.signal_alert_date = now.date()
+            store.signal_alerted_slots.clear()
+        if slot in store.signal_alerted_slots:
+            return
+        store.signal_alerted_slots.add(slot)
+        tickers = list(store.tickers)
+
+    try:
+        signals = calculate_intraday_signals(
+            STOCK_HISTORY_DATABASE,
+            quotes,
+            tickers,
+            now.date(),
+            ma_short_period,
+            ma_long_period,
+            rsi_level1,
+            rsi_level2,
+        )
+    except Exception:
+        logging.exception("Could not calculate scheduled intraday signals")
+        return
+    if not signals:
+        return
+
+    visible_signals = signals[:50]
+    message = (
+        f"StockBoard BUY/SELL signals ({now:%Y-%m-%d %H:%M})\n"
+        f"{len(signals)} signal(s); showing {len(visible_signals)}:\n\n"
+        + "\n".join(
+            f"{item['ticker']} {item['signal']} | Price {item['price']:.2f} | "
+            f"MA{item['ma_short_period']} {item['ma20']:.2f} | "
+            f"MA{item['ma_long_period']} {item['ma50']:.2f} | "
+            f"RSI14 {item['rsi14']:.1f}"
+            for item in visible_signals
+        )
+    )
+    for chat_id in chat_ids:
+        sent, error = send_telegram_message(chat_id, message)
+        if not sent:
+            logging.warning(
+                "Scheduled signal alert to %s failed: %s", chat_id, error
+            )
+
+
+def send_periodic_price_updates(store, quotes, now):
+    enabled, interval_minutes, chat_ids = store.price_update_settings()
+    if not enabled or not TELEGRAM_BOT_TOKEN or not chat_ids:
+        return
+    slot = scheduled_signal_slot(now, interval_minutes)
+    if slot is None:
+        return
+
+    with store.lock:
+        if store.price_update_date != now.date():
+            store.price_update_date = now.date()
+            store.price_update_slots.clear()
+            store.price_update_last_prices = None
+        if slot in store.price_update_slots:
+            return
+        store.price_update_slots.add(slot)
+        tickers = list(store.tickers)
+        volume_lookback_sessions = store.volume_settings()
+        current_prices = {}
+        for ticker in tickers:
+            quote = quotes.get(ticker)
+            if not quote:
+                continue
+            try:
+                price = float(quote["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(price) and price > 0:
+                current_prices[ticker] = price
+
+        previous_prices = store.price_update_last_prices
+        if previous_prices is None:
+            store.price_update_last_prices = current_prices
+            return
+        changed = [
+            (ticker, previous_prices[ticker], price)
+            for ticker, price in current_prices.items()
+            if ticker in previous_prices
+            and not math.isclose(price, previous_prices[ticker], rel_tol=0, abs_tol=1e-9)
+        ]
+        if not changed:
+            store.price_update_last_prices = current_prices
+            return
+
+    average_volumes = get_average_volumes(
+        STOCK_HISTORY_DATABASE,
+        tickers,
+        now.date(),
+        volume_lookback_sessions,
+    )
+    lines = [
+        f"{ticker}: {old_price:.2f} -> {new_price:.2f} "
+        f"({(new_price - old_price) / old_price * 100:+.2f}%) | "
+        f"Vol {volume_relative_to_average(ticker, quotes, average_volumes)[0]:,.0f} | "
+        f"Vol/TB {volume_lookback_sessions}p "
+        f"{volume_relative_to_average(ticker, quotes, average_volumes)[1]}"
+        for ticker, old_price, new_price in changed[:80]
+    ]
+    message = (
+        f"StockBoard price changes ({now:%Y-%m-%d %H:%M})\n"
+        f"{len(changed)} ticker(s) changed since the previous update; "
+        f"showing {len(lines)}:\n\n"
+        + "\n".join(lines)
+    )
+    all_sent = True
+    for chat_id in chat_ids:
+        sent, error = send_telegram_message(chat_id, message)
+        if not sent:
+            all_sent = False
+            logging.warning("Periodic price update to %s failed: %s", chat_id, error)
+    if all_sent:
+        with store.lock:
+            store.price_update_last_prices = current_prices
+
+
+def send_telegram_test(
+    chat_ids, threshold, duration_minutes, price_update_enabled,
+    signal_interval_minutes, volume_lookback_sessions,
+    buy_sell_settings, tickers, quotes, updated_at,
+):
+    buy_sell_enabled, ma_short_period, ma_long_period, rsi_level1, rsi_level2 = (
+        buy_sell_settings
+    )
     message = (
         "StockBoard test message. Telegram delivery is working.\n"
-        f"Current alert rule: +/-{threshold:g}% sustained for {duration_minutes} min."
+        f"Current price alert: +/-{threshold:g}% sustained for {duration_minutes} min.\n"
+        f"Price change summary: {'enabled' if price_update_enabled else 'disabled'}; "
+        f"interval {signal_interval_minutes} min; "
+        f"volume average lookback {volume_lookback_sessions} sessions.\n"
+        "Schedule: weekdays 09:00–15:00, final check at 15:30.\n"
     )
+    if not buy_sell_enabled:
+        message += "BUY/SELL Telegram sending is disabled."
+    else:
+        message += (
+            f"BUY/SELL rule: MA{ma_short_period}/{ma_long_period}; "
+            f"RSI levels {rsi_level1:g}/{rsi_level2:g}."
+        )
     if not quotes:
         message += "\n\nLive ticker snapshot is not available."
     else:
@@ -474,28 +795,42 @@ def send_telegram_test(chat_ids, threshold, duration_minutes, tickers, quotes, u
             reverse=True,
         )
         snapshot_time = updated_at.strftime("%Y-%m-%d %H:%M:%S") if updated_at else "unknown"
+        snapshot_date = updated_at.date() if updated_at else datetime.now().date()
+        average_volumes = get_average_volumes(
+            STOCK_HISTORY_DATABASE,
+            tickers,
+            snapshot_date,
+            volume_lookback_sessions,
+        )
         message += f"\n\nLive ticker snapshot (updated {snapshot_time}):\n"
         message += format_ticker_alert_sections(
-            strong_tickers, weak_tickers, quotes, threshold
+            strong_tickers,
+            weak_tickers,
+            quotes,
+            threshold,
+            average_volumes,
+            volume_lookback_sessions,
         )
 
-    signal_date, signals = get_latest_signal_snapshot(
-        STOCK_HISTORY_DATABASE,
-        tickers=tickers,
-    )
-    message += "\n\nLatest daily BUY/SELL signals"
-    if signal_date is None:
-        message += ": no signals have been recorded yet."
-    elif not signals:
-        message += f" ({signal_date}): no BUY/SELL signals."
-    else:
-        message += f" ({signal_date}; up to {len(signals)} shown):\n"
-        message += "\n".join(
-            f"{item['ticker']} {item['signal']} | "
-            f"MA20 {item['ma20']:.2f} | MA50 {item['ma50']:.2f} | "
-            f"RSI14 {item['rsi14']:.1f}"
-            for item in signals
+    if buy_sell_enabled:
+        signal_date, signals = get_latest_signal_snapshot(
+            STOCK_HISTORY_DATABASE,
+            tickers=tickers,
         )
+        message += "\n\nLatest daily BUY/SELL signals"
+        if signal_date is None:
+            message += ": no signals have been recorded yet."
+        elif not signals:
+            message += f" ({signal_date}): no BUY/SELL signals."
+        else:
+            message += f" ({signal_date}; up to {len(signals)} shown):\n"
+            message += "\n".join(
+                f"{item['ticker']} {item['signal']} | "
+                f"MA{item['ma_short_period']} {item['ma20']:.2f} | "
+                f"MA{item['ma_long_period']} {item['ma50']:.2f} | "
+                f"RSI14 {item['rsi14']:.1f}"
+                for item in signals
+            )
 
     successful, failed = [], []
     for chat_id in chat_ids:
@@ -560,16 +895,26 @@ def poll_forever(store):
         started = time.monotonic()
         try:
             quotes, session = fetch_price_board(store.tickers)
+            now = datetime.now()
+            _, ma_short_period, ma_long_period, rsi_level1, rsi_level2 = (
+                store.signal_settings()
+            )
             try:
                 record_daily_close(
                     STOCK_HISTORY_DATABASE,
                     quotes,
-                    datetime.now(),
+                    now,
                     session,
+                    ma_short_period,
+                    ma_long_period,
+                    rsi_level1,
+                    rsi_level2,
                 )
             except Exception:
                 logging.exception("Could not capture daily stock history")
             send_threshold_alerts(store, quotes)
+            send_periodic_price_updates(store, quotes, now)
+            send_scheduled_signal_alerts(store, quotes, now)
             with store.lock:
                 store.quotes = quotes
                 store.session = session
@@ -824,8 +1169,8 @@ def manage_sectors():
 
 
 # 7. Header Bar
-col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns(
-    [5, 1.1, 1.1, 1.2, 1.3], vertical_alignment="center"
+col_h1, col_h2, col_h3, col_h4, col_h5, col_h6 = st.columns(
+    [4.8, 1, 1, 1.15, 1.35, 1.2], vertical_alignment="center"
 )
 with col_h1:
     st.markdown('<div class="app-title">📈 Bang Gia Phan Nganh Chung Khoan</div>', unsafe_allow_html=True)
@@ -889,16 +1234,139 @@ with col_h4:
         )
         recent_signals = get_recent_signals(STOCK_HISTORY_DATABASE)
         if recent_signals:
+            signal_rows = [
+                {
+                    "Ticker": item["ticker"],
+                    "Date": item["trade_date"],
+                    "Signal": item["signal"],
+                    f"MA{item['ma_short_period']}": item["ma20"],
+                    f"MA{item['ma_long_period']}": item["ma50"],
+                    "RSI14": item["rsi14"],
+                }
+                for item in recent_signals
+            ]
             st.dataframe(
-                recent_signals,
+                signal_rows,
                 hide_index=True,
                 alt="Recent BUY and SELL signals calculated from daily price history",
             )
         else:
             st.caption("No BUY or SELL crossover signals recorded yet.")
-        st.caption("BUY/SELL rule: MA20 crossover MA50, filtered by RSI14.")
+        (
+            display_buy_sell_enabled,
+            display_ma_short_period,
+            display_ma_long_period,
+            display_rsi_level1,
+            display_rsi_level2,
+        ) = store.signal_settings()
+        st.caption(
+            (
+                f"BUY/SELL rule: MA{display_ma_short_period} crosses "
+                f"MA{display_ma_long_period}, RSI "
+                f"{display_rsi_level1:g}/{display_rsi_level2:g}."
+            )
+            if display_buy_sell_enabled
+            else "BUY/SELL Telegram sending is disabled."
+        )
 
 with col_h5:
+    with st.popover("📈 Tín hiệu", width="stretch"):
+        st.subheader("Thiết lập tín hiệu MUA/BÁN")
+        (
+            current_buy_sell_enabled,
+            current_ma_short,
+            current_ma_long,
+            current_rsi1,
+            current_rsi2,
+        ) = store.signal_settings()
+        with st.form("buy_sell_signal_settings"):
+            buy_sell_enabled_input = st.checkbox(
+                "Gửi tín hiệu BUY/SELL qua Telegram",
+                value=current_buy_sell_enabled,
+            )
+            ma_short_input = st.number_input(
+                "MA ngắn hạn (số phiên)",
+                min_value=2,
+                max_value=499,
+                value=int(current_ma_short),
+                step=1,
+            )
+            ma_long_input = st.number_input(
+                "MA dài hạn (số phiên)",
+                min_value=3,
+                max_value=500,
+                value=int(current_ma_long),
+                step=1,
+            )
+            rsi_level1_input = st.number_input(
+                "RSI mức 1",
+                min_value=0.0,
+                max_value=99.0,
+                value=float(current_rsi1),
+                step=1.0,
+            )
+            rsi_level2_input = st.number_input(
+                "RSI mức 2",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(current_rsi2),
+                step=1.0,
+            )
+            st.caption(
+                "BUY khi MA ngắn cắt lên MA dài và RSI nằm trong mức 1–2. "
+                "SELL khi MA ngắn cắt xuống MA dài và RSI nằm trong "
+                "(100 - mức 2) đến mức 1."
+            )
+            save_buy_sell_settings = st.form_submit_button(
+                "Lưu thiết lập tín hiệu", width="stretch"
+            )
+
+        if save_buy_sell_settings:
+            if not 2 <= ma_short_input < ma_long_input <= 500:
+                st.error("MA ngắn hạn phải nhỏ hơn MA dài hạn (2 đến 500 phiên).")
+            elif (
+                not math.isfinite(rsi_level1_input)
+                or not math.isfinite(rsi_level2_input)
+                or not 0 <= rsi_level1_input < rsi_level2_input <= 100
+            ):
+                st.error("RSI mức 1 phải nhỏ hơn RSI mức 2 (trong khoảng 0–100).")
+            else:
+                (
+                    current_alert_enabled,
+                    current_threshold,
+                    current_duration,
+                    current_interval,
+                    current_chat_ids,
+                ) = store.alert_settings()
+                current_price_update_enabled, _, _ = store.price_update_settings()
+                try:
+                    save_telegram_alert_settings(
+                        current_alert_enabled,
+                        current_threshold,
+                        current_duration,
+                        current_interval,
+                        store.volume_settings(),
+                        current_price_update_enabled,
+                        buy_sell_enabled_input,
+                        ma_short_input,
+                        ma_long_input,
+                        rsi_level1_input,
+                        rsi_level2_input,
+                        current_chat_ids,
+                    )
+                except OSError as error:
+                    st.error(f"Could not save signal settings: {error}")
+                else:
+                    store.update_signal_settings(
+                        buy_sell_enabled_input,
+                        ma_short_input,
+                        ma_long_input,
+                        rsi_level1_input,
+                        rsi_level2_input,
+                    )
+                    st.success("Đã lưu thiết lập tín hiệu BUY/SELL.")
+
+with col_h6:
     with st.popover("📨 Telegram", width="stretch"):
         bot_status = get_telegram_bot_status()
         status_led = "🟢" if bot_status == "Running" else "🔴"
@@ -922,10 +1390,19 @@ with col_h5:
         with st.expander("User conversations", expanded=False):
             render_telegram_inbox()
 
-        current_enabled, current_threshold, current_duration, current_chat_ids = store.alert_settings()
+        (
+            current_enabled,
+            current_threshold,
+            current_duration,
+            current_signal_interval,
+            current_chat_ids,
+        ) = store.alert_settings()
+        current_price_update_enabled, _, _ = store.price_update_settings()
+        current_volume_lookback = store.volume_settings()
+        current_buy_sell_settings = store.signal_settings()
         with st.form("telegram_alert_settings"):
             enabled_input = st.checkbox(
-                "Enable Telegram price alerts",
+                "Enable threshold-based price alerts",
                 value=current_enabled,
             )
             threshold_input = st.number_input(
@@ -943,6 +1420,31 @@ with col_h5:
                 value=int(current_duration),
                 step=1,
             )
+            signal_interval_input = st.number_input(
+                "Price update interval (minutes)",
+                min_value=5,
+                max_value=360,
+                value=int(current_signal_interval),
+                step=5,
+            )
+            volume_lookback_input = st.selectbox(
+                "Vol bình quân so với N phiên trước",
+                options=list(range(10, 101, 5)),
+                index=list(range(10, 101, 5)).index(current_volume_lookback),
+                format_func=lambda sessions: f"{sessions} phiên",
+            )
+            st.caption(
+                "Tỷ lệ = volume hiện tại / volume bình quân các phiên trước × 100%. "
+                "Thiếu lịch sử sẽ hiển thị N/A."
+            )
+            st.caption(
+                "Weekdays: check from 09:00 through 15:00 at this interval, "
+                "plus a final check at 15:30. A summary is sent only when prices changed."
+            )
+            price_update_enabled_input = st.checkbox(
+                "Send consolidated price changes to Telegram",
+                value=current_price_update_enabled,
+            )
             chat_ids_input = st.text_input(
                 "Telegram chat IDs (comma-separated)",
                 value=", ".join(current_chat_ids),
@@ -957,20 +1459,38 @@ with col_h5:
                 st.error("Threshold must be between 0.1% and 100%.")
             elif not 1 <= duration_input <= 1440:
                 st.error("Duration must be between 1 and 1440 minutes.")
+            elif not 5 <= signal_interval_input <= 360:
+                st.error("Signal interval must be between 5 and 360 minutes.")
             else:
                 try:
                     save_telegram_alert_settings(
-                        enabled_input, threshold_input, duration_input, chat_ids
+                        enabled_input,
+                        threshold_input,
+                        duration_input,
+                        signal_interval_input,
+                        volume_lookback_input,
+                        price_update_enabled_input,
+                        *current_buy_sell_settings,
+                        chat_ids,
                     )
                 except OSError as e:
                     st.error(f"Could not save Telegram settings: {e}")
                 else:
                     store.update_alert_settings(
-                        enabled_input, threshold_input, duration_input, chat_ids
+                        enabled_input,
+                        threshold_input,
+                        duration_input,
+                        signal_interval_input,
+                        chat_ids,
                     )
+                    store.update_price_update_settings(price_update_enabled_input)
+                    store.update_volume_settings(volume_lookback_input)
                     current_enabled = enabled_input
                     current_threshold = threshold_input
                     current_duration = duration_input
+                    current_signal_interval = signal_interval_input
+                    current_volume_lookback = volume_lookback_input
+                    current_price_update_enabled = price_update_enabled_input
                     current_chat_ids = chat_ids
                     st.success("Telegram alert settings saved.")
 
@@ -984,14 +1504,20 @@ with col_h5:
                 not math.isfinite(threshold_input)
                 or not 0 < threshold_input <= 100
                 or not 1 <= duration_input <= 1440
+                or not 5 <= signal_interval_input <= 360
+                or volume_lookback_input not in range(10, 101, 5)
             ):
-                st.error("Enter a valid threshold and duration before sending a test.")
+                st.error("Enter valid alert settings before sending a test.")
             else:
                 quotes, quotes_updated_at, _, _ = store.snapshot()
                 successful, failed = send_telegram_test(
                     chat_ids,
                     threshold_input,
                     duration_input,
+                    current_price_update_enabled,
+                    signal_interval_input,
+                    volume_lookback_input,
+                    current_buy_sell_settings,
                     list(store.tickers),
                     quotes,
                     quotes_updated_at,

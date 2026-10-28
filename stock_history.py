@@ -77,12 +77,27 @@ def initialize_database(database_path):
                     ma20 REAL NOT NULL,
                     ma50 REAL NOT NULL,
                     rsi14 REAL NOT NULL,
+                    ma_short_period INTEGER NOT NULL DEFAULT 20,
+                    ma_long_period INTEGER NOT NULL DEFAULT 50,
                     PRIMARY KEY (ticker, trade_date),
                     FOREIGN KEY (ticker, trade_date)
                         REFERENCES daily_prices (ticker, trade_date)
                 )
                 """
             )
+            signal_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(daily_signals)")
+            }
+            if "ma_short_period" not in signal_columns:
+                connection.execute(
+                    "ALTER TABLE daily_signals ADD COLUMN "
+                    "ma_short_period INTEGER NOT NULL DEFAULT 20"
+                )
+            if "ma_long_period" not in signal_columns:
+                connection.execute(
+                    "ALTER TABLE daily_signals ADD COLUMN "
+                    "ma_long_period INTEGER NOT NULL DEFAULT 50"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_daily_signals_date "
                 "ON daily_signals (trade_date DESC, signal, ticker)"
@@ -241,15 +256,25 @@ def import_csv_files(database_path, files, progress_callback=None):
     return imported_rows, skipped_rows
 
 
-def _calculate_indicators(closes):
-    if len(closes) < 51:
+def _calculate_indicators(
+    closes,
+    ma_short_period=20,
+    ma_long_period=50,
+    rsi_level1=50.0,
+    rsi_level2=70.0,
+):
+    if not 2 <= ma_short_period < ma_long_period <= 500:
+        raise ValueError("MA periods must satisfy 2 <= short < long <= 500.")
+    if not 0 <= rsi_level1 < rsi_level2 <= 100:
+        raise ValueError("RSI levels must satisfy 0 <= level 1 < level 2 <= 100.")
+    if len(closes) < ma_long_period + 1:
         return None
 
-    previous_closes = closes[-51:-1]
-    ma20 = math.fsum(closes[-20:]) / 20
-    ma50 = math.fsum(closes[-50:]) / 50
-    previous_ma20 = math.fsum(previous_closes[-20:]) / 20
-    previous_ma50 = math.fsum(previous_closes) / 50
+    previous_closes = closes[-ma_long_period - 1:-1]
+    ma_short = math.fsum(closes[-ma_short_period:]) / ma_short_period
+    ma_long = math.fsum(closes[-ma_long_period:]) / ma_long_period
+    previous_ma_short = math.fsum(previous_closes[-ma_short_period:]) / ma_short_period
+    previous_ma_long = math.fsum(previous_closes) / ma_long_period
 
     changes = [
         current - previous
@@ -262,18 +287,90 @@ def _calculate_indicators(closes):
     else:
         rsi14 = 100 - 100 / (1 + average_gain / average_loss)
 
-    crossed_up = previous_ma20 <= previous_ma50 and ma20 > ma50
-    crossed_down = previous_ma20 >= previous_ma50 and ma20 < ma50
-    if crossed_up and 50 <= rsi14 < 70:
+    crossed_up = previous_ma_short <= previous_ma_long and ma_short > ma_long
+    crossed_down = previous_ma_short >= previous_ma_long and ma_short < ma_long
+    if crossed_up and rsi_level1 <= rsi14 < rsi_level2:
         signal = "BUY"
-    elif crossed_down and 30 <= rsi14 <= 50:
+    elif crossed_down and 100 - rsi_level2 <= rsi14 <= rsi_level1:
         signal = "SELL"
     else:
         signal = "HOLD"
-    return signal, ma20, ma50, rsi14
+    return signal, ma_short, ma_long, rsi14
 
 
-def record_daily_close(database_path, quotes, captured_at, session):
+def calculate_intraday_signals(
+    database_path,
+    quotes,
+    tickers,
+    trade_date,
+    ma_short_period=20,
+    ma_long_period=50,
+    rsi_level1=50.0,
+    rsi_level2=70.0,
+):
+    initialize_database(database_path)
+    trade_date = trade_date.isoformat() if hasattr(trade_date, "isoformat") else str(trade_date)
+    signals = []
+    with _database_connection(database_path) as connection:
+        for ticker in sorted({str(item).strip().upper() for item in tickers if str(item).strip()}):
+            quote = quotes.get(ticker)
+            if not quote:
+                continue
+            try:
+                live_close = float(quote["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(live_close) or live_close <= 0:
+                continue
+
+            history_rows_needed = max(ma_long_period, 14)
+            rows = connection.execute(
+                """
+                SELECT close FROM daily_prices
+                WHERE ticker = ? AND trade_date < ?
+                ORDER BY trade_date DESC LIMIT ?
+                """,
+                (ticker, trade_date, history_rows_needed),
+            ).fetchall()
+            if len(rows) < history_rows_needed:
+                continue
+            closes = [row[0] for row in reversed(rows)] + [live_close]
+            indicators = _calculate_indicators(
+                closes,
+                ma_short_period,
+                ma_long_period,
+                rsi_level1,
+                rsi_level2,
+            )
+            if indicators is None:
+                continue
+            signal, ma20, ma50, rsi14 = indicators
+            if signal not in ("BUY", "SELL"):
+                continue
+            signals.append({
+                "ticker": ticker,
+                "trade_date": trade_date,
+                "signal": signal,
+                "price": live_close,
+                "ma20": ma20,
+                "ma50": ma50,
+                "ma_short_period": ma_short_period,
+                "ma_long_period": ma_long_period,
+                "rsi14": rsi14,
+            })
+    return signals
+
+
+def record_daily_close(
+    database_path,
+    quotes,
+    captured_at,
+    session,
+    ma_short_period=20,
+    ma_long_period=50,
+    rsi_level1=50.0,
+    rsi_level2=70.0,
+):
     if (
         captured_at.weekday() >= 5
         or captured_at.time() < time(15, 0)
@@ -328,27 +425,45 @@ def record_daily_close(database_path, quotes, captured_at, session):
                 """
                 SELECT trade_date, close FROM daily_prices
                 WHERE ticker = ? AND trade_date <= ?
-                ORDER BY trade_date DESC LIMIT 51
+                ORDER BY trade_date DESC LIMIT ?
                 """,
-                (ticker, trade_date),
+                (ticker, trade_date, max(ma_long_period + 1, 15)),
             ).fetchall()
             rows.reverse()
-            indicators = _calculate_indicators([row[1] for row in rows])
+            indicators = _calculate_indicators(
+                [row[1] for row in rows],
+                ma_short_period,
+                ma_long_period,
+                rsi_level1,
+                rsi_level2,
+            )
             if indicators is None:
                 continue
             signal, ma20, ma50, rsi14 = indicators
             connection.execute(
                 """
                 INSERT INTO daily_signals (
-                    ticker, trade_date, signal, ma20, ma50, rsi14
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    ticker, trade_date, signal, ma20, ma50, rsi14,
+                    ma_short_period, ma_long_period
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (ticker, trade_date) DO UPDATE SET
                     signal = excluded.signal,
                     ma20 = excluded.ma20,
                     ma50 = excluded.ma50,
-                    rsi14 = excluded.rsi14
+                    rsi14 = excluded.rsi14,
+                    ma_short_period = excluded.ma_short_period,
+                    ma_long_period = excluded.ma_long_period
                 """,
-                (ticker, trade_date, signal, ma20, ma50, rsi14),
+                (
+                    ticker,
+                    trade_date,
+                    signal,
+                    ma20,
+                    ma50,
+                    rsi14,
+                    ma_short_period,
+                    ma_long_period,
+                ),
             )
             if signal != "HOLD":
                 new_signals.append({
@@ -357,6 +472,8 @@ def record_daily_close(database_path, quotes, captured_at, session):
                     "signal": signal,
                     "ma20": ma20,
                     "ma50": ma50,
+                    "ma_short_period": ma_short_period,
+                    "ma_long_period": ma_long_period,
                     "rsi14": rsi14,
                 })
 
@@ -385,13 +502,43 @@ def get_history_summary(database_path):
         return row_count, latest_date
 
 
+def get_average_volumes(database_path, tickers, as_of_date, lookback_sessions):
+    initialize_database(database_path)
+    ticker_list = sorted({str(ticker).strip().upper() for ticker in tickers if str(ticker).strip()})
+    if not ticker_list:
+        return {}
+    trade_date = as_of_date.isoformat() if hasattr(as_of_date, "isoformat") else str(as_of_date)
+    placeholders = ", ".join("?" for _ in ticker_list)
+    with _database_connection(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT ticker, AVG(volume)
+            FROM (
+                SELECT ticker, volume,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY ticker ORDER BY trade_date DESC
+                       ) AS session_number
+                FROM daily_prices
+                WHERE ticker IN ({placeholders})
+                  AND trade_date < ?
+                  AND volume IS NOT NULL
+            )
+            WHERE session_number <= ?
+            GROUP BY ticker
+            """,
+            (*ticker_list, trade_date, lookback_sessions),
+        ).fetchall()
+    return {ticker: average for ticker, average in rows}
+
+
 def get_recent_signals(database_path, limit=100):
     initialize_database(database_path)
     with _database_connection(database_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT ticker, trade_date, signal, ma20, ma50, rsi14
+                 SELECT ticker, trade_date, signal, ma20, ma50, rsi14,
+                     ma_short_period, ma_long_period
             FROM daily_signals
             WHERE signal IN ('BUY', 'SELL')
             ORDER BY trade_date DESC, ticker
@@ -415,7 +562,8 @@ def get_latest_signal_snapshot(database_path, limit=20, tickers=None):
         if latest_date is None:
             return None, []
         query = (
-            "SELECT ticker, trade_date, signal, ma20, ma50, rsi14 "
+            "SELECT ticker, trade_date, signal, ma20, ma50, rsi14, "
+            "ma_short_period, ma_long_period "
             "FROM daily_signals "
             "WHERE trade_date = ? AND signal IN ('BUY', 'SELL')"
         )
